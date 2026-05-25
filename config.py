@@ -14,6 +14,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _env(key, default=""):
+    """Lee env var y elimina comentarios inline (texto tras espacios/←/#)."""
+    raw = os.getenv(key, default)
+    # Corta en el primer espacio, #, ← o ← unicode
+    import re
+    raw = re.split(r'[\s#←]', raw.strip())[0]
+    return raw
+
+def _envf(key, default):
+    return float(_env(key, str(default)))
+
+def _envi(key, default):
+    return int(_env(key, str(default)))
+
+
 
 @dataclass
 class Config:
@@ -34,17 +49,17 @@ class Config:
                               "DOGE-USDT,ADA-USDT,AVAX-USDT,MATIC-USDT,LINK-USDT,"
                               "LTC-USDT,DOT-USDT,UNI-USDT,ATOM-USDT,FIL-USDT").split(",")
     ])
-    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "50000000"))
-    MAX_SYMBOLS    : int   = int(os.getenv("MAX_SYMBOLS", "30"))
+    MIN_VOLUME_USDT: float = _envf("MIN_VOLUME_USDT", 50000000)
+    MAX_SYMBOLS    : int   = _envi("MAX_SYMBOLS", 30)
 
     # ── Riesgo ───────────────────────────────────────────────
-    LEVERAGE          : int   = int(os.getenv("LEVERAGE", "10"))
-    RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PCT", "1.0"))
-    MAX_DAILY_DD_PCT  : float = float(os.getenv("MAX_DD_PCT", "5.0"))
-    MAX_OPEN_POSITIONS: int   = int(os.getenv("MAX_POSITIONS", "5"))
+    LEVERAGE          : int   = _envi("LEVERAGE", 10)
+    RISK_PER_TRADE_PCT: float = _envf("RISK_PCT", 1.0)
+    MAX_DAILY_DD_PCT  : float = _envf("MAX_DD_PCT", 5.0)
+    MAX_OPEN_POSITIONS: int   = _envi("MAX_POSITIONS", 5)
 
     # ── R:R ─────────────────────────────────────────────────
-    TP_RR: float = float(os.getenv("TP_RR", "2.0"))
+    TP_RR: float = _envf("TP_RR", 2.0)
 
     # ── Sesiones ─────────────────────────────────────────────
     ALLOWED_SESSIONS: list[str] = field(default_factory=lambda: [
@@ -52,22 +67,22 @@ class Config:
     ])
 
     # ── Loop ─────────────────────────────────────────────────
-    LOOP_INTERVAL    : int = int(os.getenv("LOOP_INTERVAL", "30"))
-    SCANNER_INTERVAL : int = int(os.getenv("SCANNER_INTERVAL", "3600"))
+    LOOP_INTERVAL    : int = _envi("LOOP_INTERVAL", 30)
+    SCANNER_INTERVAL : int = _envi("SCANNER_INTERVAL", 3600)
 
     # ═══════════════════════════════════════════════════════
     #  UMBRALES OPTIMIZADOS v4 (mantenidos)
     # ═══════════════════════════════════════════════════════
-    SCORE_THR_LONG : float = float(os.getenv("SCORE_THR_LONG",  "0.63"))
-    SCORE_THR_SHORT: float = float(os.getenv("SCORE_THR_SHORT", "0.63"))
-    DECAY_THR      : float = float(os.getenv("DECAY_THR", "0.65"))
+    SCORE_THR_LONG : float = _envf("SCORE_THR_LONG", 0.63)
+    SCORE_THR_SHORT: float = _envf("SCORE_THR_SHORT", 0.63)
+    DECAY_THR      : float = _envf("DECAY_THR", 0.65)
 
-    MIN_CONV_STD  : int = int(os.getenv("MIN_CONV_STD",  "6"))
-    MIN_CONV_FUEL : int = int(os.getenv("MIN_CONV_FUEL", "7"))
-    MIN_CONV_SUP  : int = int(os.getenv("MIN_CONV_SUP",  "8"))
+    MIN_CONV_STD  : int = _envi("MIN_CONV_STD", 6)
+    MIN_CONV_FUEL : int = _envi("MIN_CONV_FUEL", 7)
+    MIN_CONV_SUP  : int = _envi("MIN_CONV_SUP", 8)
 
-    MIN_PROFIT_FACTOR: float = float(os.getenv("MIN_PF", "1.5"))
-    PF_WINDOW        : int   = int(os.getenv("PF_WINDOW", "20"))
+    MIN_PROFIT_FACTOR: float = _envf("MIN_PF", 1.5)
+    PF_WINDOW        : int   = _envi("PF_WINDOW", 20)
 
     # ═══════════════════════════════════════════════════════
     #  NUEVOS — v5 MEJORAS
@@ -78,42 +93,42 @@ class Config:
     # >0.3 = presión compradora significativa (añade +1 conviction)
     # >0.5 = presión fuerte (añade +2 conviction)
     # <-0.3 / <-0.5 para SHORT
-    OFI_LEVELS    : int   = int(os.getenv("OFI_LEVELS", "5"))    # niveles order book
-    OFI_THR_WEAK  : float = float(os.getenv("OFI_THR_WEAK", "0.3"))
-    OFI_THR_STRONG: float = float(os.getenv("OFI_THR_STRONG", "0.5"))
+    OFI_LEVELS    : int   = _envi("OFI_LEVELS", 5)    # niveles order book
+    OFI_THR_WEAK  : float = _envf("OFI_THR_WEAK", 0.3)
+    OFI_THR_STRONG: float = _envf("OFI_THR_STRONG", 0.5)
 
     # ── L14 Funding Rate ─────────────────────────────────────
     # BingX cobra funding cada 8h. Valores habituales: -0.001 a +0.003
     # >0.001 (+0.1%) = longs pagan, sesgo alcista institucional → favorece LONG
     # <-0.001 = shorts pagan → favorece SHORT
     # >0.005 (+0.5%) = longs MUY sobrecargados → PELIGRO para LONG (contrarian)
-    FR_BULL_THR    : float = float(os.getenv("FR_BULL_THR", "0.0001"))   # 0.01%
-    FR_BEAR_THR    : float = float(os.getenv("FR_BEAR_THR", "-0.0001"))  # -0.01%
-    FR_EXTREME_THR : float = float(os.getenv("FR_EXTREME_THR", "0.005")) # bloquea LONG si >0.5%
+    FR_BULL_THR    : float = _envf("FR_BULL_THR", 0.0001)   # 0.01%
+    FR_BEAR_THR    : float = _envf("FR_BEAR_THR", -0.0001)  # -0.01%
+    FR_EXTREME_THR : float = _envf("FR_EXTREME_THR", 0.005) # bloquea LONG si >0.5%
 
     # ── L15 Open Interest Delta ──────────────────────────────
     # OI_DELTA = (OI_actual - OI_anterior) / OI_anterior
     # >0.5% en 30s = dinero nuevo entrando (confirma tendencia)
     # <-0.5% = posiciones cerrándose (señal frágil)
-    OI_DELTA_THR: float = float(os.getenv("OI_DELTA_THR", "0.005"))  # 0.5%
+    OI_DELTA_THR: float = _envf("OI_DELTA_THR", 0.005)  # 0.5%
 
     # ── Trailing SL ─────────────────────────────────────────
     # Se activa cuando el precio se mueve a favor 1× ATR
     # Trail: precio - TRAIL_ATR_MULT × ATR (para LONG)
-    TRAIL_ACTIVATE_ATR: float = float(os.getenv("TRAIL_ACTIVATE_ATR", "1.0"))
-    TRAIL_ATR_MULT    : float = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
+    TRAIL_ACTIVATE_ATR: float = _envf("TRAIL_ACTIVATE_ATR", 1.0)
+    TRAIL_ATR_MULT    : float = _envf("TRAIL_ATR_MULT", 1.5)
 
     # ── Maker Orders ─────────────────────────────────────────
     # Si True, usa limit post-only en lugar de market (−73% fees)
     # Timeout: si no llena en MAKER_TIMEOUT segundos → market fallback
     USE_MAKER_ORDERS: bool = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
-    MAKER_TIMEOUT   : int  = int(os.getenv("MAKER_TIMEOUT", "30"))
+    MAKER_TIMEOUT   : int  = _envi("MAKER_TIMEOUT", 30)
     # Offset en % del precio para limit (0.02% por debajo del ask para BUY)
-    MAKER_OFFSET_PCT: float = float(os.getenv("MAKER_OFFSET_PCT", "0.02"))
+    MAKER_OFFSET_PCT: float = _envf("MAKER_OFFSET_PCT", 0.02)
 
     # ── Multi-TF Score ───────────────────────────────────────
     # Bonus conviction si 1m, 3m, 15m y 1h están alineados
-    MULTI_TF_BONUS  : int  = int(os.getenv("MULTI_TF_BONUS", "2"))
+    MULTI_TF_BONUS  : int  = _envi("MULTI_TF_BONUS", 2)
     USE_1H_FILTER   : bool = os.getenv("USE_1H_FILTER", "true").lower() == "true"
 
     # ═══════════════════════════════════════════════════════
