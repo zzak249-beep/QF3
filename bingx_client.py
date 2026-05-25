@@ -18,6 +18,9 @@ class BingXClient:
         self.api_key = api_key
         self.secret  = secret
         self._session = None
+        self._balance_cache: float = 0.0
+        self._balance_ts: float = 0.0
+        self._BALANCE_TTL: int = 60   # segundos entre llamadas reales a /balance
 
     async def _sess(self):
         if self._session is None or self._session.closed:
@@ -148,27 +151,33 @@ class BingXClient:
 
     # ── Account ─────────────────────────────────────────────
 
-    async def get_balance(self):
+    async def get_balance(self) -> float:
+        """Devuelve balance USDT. Cachea _BALANCE_TTL segundos para evitar rate-limit."""
+        import time as _time
+        now = _time.time()
+        if now - self._balance_ts < self._BALANCE_TTL and self._balance_cache > 0:
+            return self._balance_cache
         try:
             data = await self._get("/openApi/swap/v2/user/balance", signed=True)
-            # La API puede devolver dict con "balance", lista directa, o lista anidada
             if isinstance(data, dict):
                 items = data.get("balance", [])
             elif isinstance(data, list):
                 items = data
             else:
-                log.warning(f"get_balance: respuesta inesperada tipo {type(data)}: {data}")
-                return 0.0
+                log.warning(f"get_balance: tipo inesperado {type(data)}: {data}")
+                return self._balance_cache   # devolver último valor conocido
 
             for a in items:
                 if not isinstance(a, dict):
-                    log.debug(f"get_balance: item no-dict ignorado: {a!r}")
                     continue
                 if a.get("asset") == "USDT":
-                    return float(a.get("availableMargin", 0))
+                    val = float(a.get("availableMargin", 0))
+                    self._balance_cache = val
+                    self._balance_ts    = now
+                    return val
         except Exception as e:
             log.error(f"get_balance: {e}")
-        return 0.0
+        return self._balance_cache   # último valor conocido (nunca 0 tras primer éxito)
 
     async def get_positions(self, symbol=""):
         p = {"symbol": symbol} if symbol else {}

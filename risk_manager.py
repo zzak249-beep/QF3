@@ -44,6 +44,8 @@ class RiskManager:
                           current_balance: float,
                           max_dd_pct: float) -> bool:
         """Devuelve False si el drawdown diario supera el límite."""
+        if start_balance <= 0:
+            return True   # sin dato de balance, no bloqueamos
         dd = (start_balance - current_balance) / start_balance * 100
         if dd > max_dd_pct:
             log.warning(f"⛔ Drawdown diario {dd:.2f}% > límite {max_dd_pct}%")
