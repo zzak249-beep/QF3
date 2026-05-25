@@ -4,7 +4,7 @@ y filtra por volumen mínimo y liquidez.
 """
 import logging
 import asyncio
-from bot.bingx_client import BingXClient
+from bingx_client import BingXClient
 from config import cfg
 
 log = logging.getLogger("Scanner")
