@@ -11,13 +11,13 @@ import asyncio, logging, signal, sys
 from datetime import datetime, timezone
 
 from config import cfg
-from bot.engine import QFJPEngine
-from bot.bingx_client import BingXClient
-from bot.telegram_client import TelegramClient
-from bot.risk_manager import RiskManager
-from bot.session_filter import SessionFilter
-from bot.scanner import MarketScanner
-from bot.performance import PerformanceTracker, TradeRecord
+from engine import QFJPEngine
+from bingx_client import BingXClient
+from telegram_client import TelegramClient
+from risk_manager import RiskManager
+from session_filter import SessionFilter
+from scanner import MarketScanner
+from performance import PerformanceTracker, TradeRecord
 
 logging.basicConfig(
     level=logging.INFO,
