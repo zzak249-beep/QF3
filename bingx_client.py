@@ -20,7 +20,8 @@ class BingXClient:
         self._session = None
         self._balance_cache: float = 0.0
         self._balance_ts: float = 0.0
-        self._BALANCE_TTL: int = 60   # segundos entre llamadas reales a /balance
+        self._BALANCE_TTL: int = 90   # segundos entre llamadas reales a /balance
+        self._balance_lock: asyncio.Lock = asyncio.Lock()
 
     async def _sess(self):
         if self._session is None or self._session.closed:
@@ -152,32 +153,46 @@ class BingXClient:
     # ── Account ─────────────────────────────────────────────
 
     async def get_balance(self) -> float:
-        """Devuelve balance USDT. Cachea _BALANCE_TTL segundos para evitar rate-limit."""
+        """
+        Devuelve balance USDT con caché de _BALANCE_TTL segundos.
+        asyncio.Lock garantiza que solo UNA corutina llama a la API a la vez;
+        el resto espera y reutiliza el valor cacheado.
+        """
         import time as _time
         now = _time.time()
-        if now - self._balance_ts < self._BALANCE_TTL and self._balance_cache > 0:
+        # Lectura rápida sin lock si el caché aún es válido
+        if self._balance_ts > 0 and (now - self._balance_ts) < self._BALANCE_TTL:
             return self._balance_cache
-        try:
-            data = await self._get("/openApi/swap/v2/user/balance", signed=True)
-            if isinstance(data, dict):
-                items = data.get("balance", [])
-            elif isinstance(data, list):
-                items = data
-            else:
-                log.warning(f"get_balance: tipo inesperado {type(data)}: {data}")
-                return self._balance_cache   # devolver último valor conocido
 
-            for a in items:
-                if not isinstance(a, dict):
-                    continue
-                if a.get("asset") == "USDT":
-                    val = float(a.get("availableMargin", 0))
-                    self._balance_cache = val
-                    self._balance_ts    = now
-                    return val
-        except Exception as e:
-            log.error(f"get_balance: {e}")
-        return self._balance_cache   # último valor conocido (nunca 0 tras primer éxito)
+        async with self._balance_lock:
+            # Doble check: otra corutina puede haber actualizado mientras esperábamos
+            now = _time.time()
+            if self._balance_ts > 0 and (now - self._balance_ts) < self._BALANCE_TTL:
+                return self._balance_cache
+
+            try:
+                data = await self._get("/openApi/swap/v2/user/balance", signed=True)
+                if isinstance(data, dict):
+                    items = data.get("balance", [])
+                elif isinstance(data, list):
+                    items = data
+                else:
+                    log.warning(f"get_balance: tipo inesperado {type(data)}: {data}")
+                    return self._balance_cache
+
+                for a in items:
+                    if not isinstance(a, dict):
+                        continue
+                    if a.get("asset") == "USDT":
+                        val = float(a.get("availableMargin", 0))
+                        self._balance_cache = val
+                        self._balance_ts    = _time.time()
+                        log.debug(f"get_balance: actualizado → {val:.2f} USDT")
+                        return val
+            except Exception as e:
+                log.error(f"get_balance: {e}")
+
+            return self._balance_cache  # último valor conocido si falla la API
 
     async def get_positions(self, symbol=""):
         p = {"symbol": symbol} if symbol else {}
