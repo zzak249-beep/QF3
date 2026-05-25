@@ -1,1 +1,1 @@
-# QF×JP Bot v3.0
+# QF×JP Bot v5.0
