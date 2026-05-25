@@ -149,10 +149,25 @@ class BingXClient:
     # ── Account ─────────────────────────────────────────────
 
     async def get_balance(self):
-        data = await self._get("/openApi/swap/v2/user/balance", signed=True)
-        for a in data.get("balance", []):
-            if a.get("asset") == "USDT":
-                return float(a.get("availableMargin", 0))
+        try:
+            data = await self._get("/openApi/swap/v2/user/balance", signed=True)
+            # La API puede devolver dict con "balance", lista directa, o lista anidada
+            if isinstance(data, dict):
+                items = data.get("balance", [])
+            elif isinstance(data, list):
+                items = data
+            else:
+                log.warning(f"get_balance: respuesta inesperada tipo {type(data)}: {data}")
+                return 0.0
+
+            for a in items:
+                if not isinstance(a, dict):
+                    log.debug(f"get_balance: item no-dict ignorado: {a!r}")
+                    continue
+                if a.get("asset") == "USDT":
+                    return float(a.get("availableMargin", 0))
+        except Exception as e:
+            log.error(f"get_balance: {e}")
         return 0.0
 
     async def get_positions(self, symbol=""):
