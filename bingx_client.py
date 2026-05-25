@@ -1,9 +1,9 @@
 """
-Cliente BingX v5 — fixes v5.1:
-  • r.json(content_type=None)  → evita ContentTypeError si BingX devuelve HTML
-  • isinstance(data, dict)     → evita AttributeError 'str' object has no attribute 'get'
-  • get_balance() con try/except robusto
-  • close() en sesión aiohttp para evitar Unclosed connector
+Cliente BingX v5 — nuevos endpoints:
+  • get_orderbook     → Order Flow Imbalance (L13)
+  • get_funding_rate  → Funding Rate filter (L14)
+  • get_open_interest → Open Interest Delta (L15)
+  • place_maker_order → limit post-only con market fallback
 """
 import asyncio, hashlib, hmac, time, logging
 from urllib.parse import urlencode
@@ -26,19 +26,9 @@ class BingXClient:
                 timeout=aiohttp.ClientTimeout(total=15))
         return self._session
 
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    def _sign(self, params: dict) -> str:
+    def _sign(self, params):
         q = urlencode(sorted(params.items()))
-        return hmac.new(
-            self.secret.encode("utf-8"),
-            q.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-
-    # ── _get / _post robustos ────────────────────────────────
+        return hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
 
     async def _get(self, path, params=None, signed=False):
         params = params or {}
@@ -47,18 +37,9 @@ class BingXClient:
             params["signature"] = self._sign(params)
         s = await self._sess()
         async with s.get(BASE + path, params=params) as r:
-            # content_type=None evita ContentTypeError cuando BingX devuelve HTML
-            data = await r.json(content_type=None)
-
-        # FIX PRINCIPAL: si data no es dict, no se puede llamar .get()
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                f"GET {path}: respuesta inesperada tipo={type(data).__name__} "
-                f"val={str(data)[:200]}"
-            )
-        code = data.get("code", 0)
-        if code != 0:
-            raise RuntimeError(f"GET {path} code={code}: {data.get('msg', data)}")
+            data = await r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"GET {path}: {data}")
         return data.get("data", data)
 
     async def _post(self, path, params=None):
@@ -67,94 +48,51 @@ class BingXClient:
         params["signature"] = self._sign(params)
         s = await self._sess()
         async with s.post(BASE + path, params=params) as r:
-            data = await r.json(content_type=None)
-
-        if not isinstance(data, dict):
-            raise RuntimeError(
-                f"POST {path}: respuesta inesperada tipo={type(data).__name__} "
-                f"val={str(data)[:200]}"
-            )
-        code = data.get("code", 0)
-        if code != 0:
-            raise RuntimeError(f"POST {path} code={code}: {data.get('msg', data)}")
+            data = await r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"POST {path}: {data}")
         return data.get("data", data)
 
     # ── Market Data ─────────────────────────────────────────
 
     async def get_all_tickers(self) -> list:
-        try:
-            data = await self._get("/openApi/swap/v2/quote/ticker")
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                # algunos endpoints envuelven en {"tickers": [...]}
-                for key in ("tickers", "data", "result"):
-                    if isinstance(data.get(key), list):
-                        return data[key]
-            return []
-        except Exception as e:
-            log.error(f"get_all_tickers: {e}")
-            return []
+        data = await self._get("/openApi/swap/v2/quote/ticker")
+        if isinstance(data, list): return data
+        return []
 
     async def get_klines(self, symbol, interval, limit=200):
-        try:
-            data = await self._get(
-                "/openApi/swap/v2/quote/klines",
-                {"symbol": symbol, "interval": interval, "limit": limit}
-            )
-            rows = data if isinstance(data, list) else []
-            result = []
-            for k in rows:
-                try:
-                    if isinstance(k, dict):
-                        result.append([
-                            int(k["time"]),
-                            float(k["open"]),
-                            float(k["high"]),
-                            float(k["low"]),
-                            float(k["close"]),
-                            float(k["volume"]),
-                        ])
-                    elif isinstance(k, (list, tuple)) and len(k) >= 6:
-                        result.append([int(k[0]), float(k[1]), float(k[2]),
-                                       float(k[3]), float(k[4]), float(k[5])])
-                except (KeyError, TypeError, ValueError) as ke:
-                    log.debug(f"get_klines {symbol} fila ignorada: {ke}")
-            return sorted(result, key=lambda x: x[0])
-        except Exception as e:
-            log.error(f"get_klines {symbol} {interval}: {e}")
-            return []
+        data = await self._get("/openApi/swap/v2/quote/klines",
+                               {"symbol": symbol, "interval": interval, "limit": limit})
+        result = []
+        for k in (data if isinstance(data, list) else []):
+            result.append([int(k["time"]), float(k["open"]), float(k["high"]),
+                           float(k["low"]), float(k["close"]), float(k["volume"])])
+        return sorted(result, key=lambda x: x[0])
 
     async def get_ticker(self, symbol):
-        try:
-            data = await self._get(
-                "/openApi/swap/v2/quote/ticker", {"symbol": symbol}
-            )
-            t = data[0] if isinstance(data, list) else data
-            if not isinstance(t, dict):
-                raise ValueError(f"ticker item no es dict: {type(t)}")
-            return {
-                "last"  : float(t.get("lastPrice", 0)),
-                "bid"   : float(t.get("bidPrice", 0)),
-                "ask"   : float(t.get("askPrice", 0)),
-                "volume": float(t.get("volume", 0)),
-            }
-        except Exception as e:
-            log.error(f"get_ticker {symbol}: {e}")
-            return {"last": 0.0, "bid": 0.0, "ask": 0.0, "volume": 0.0}
+        data = await self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+        t = data[0] if isinstance(data, list) else data
+        return {
+            "last"  : float(t["lastPrice"]),
+            "bid"   : float(t.get("bidPrice", 0)),
+            "ask"   : float(t.get("askPrice", 0)),
+            "volume": float(t.get("volume", 0)),
+        }
 
     # ── L13: Order Flow Imbalance ────────────────────────────
 
     async def get_ofi(self, symbol: str, levels: int = 5) -> float:
+        """
+        Order Flow Imbalance: (bid_qty - ask_qty) / total.
+        Rango -1 a +1. >0 = presión compradora.
+        """
         try:
-            data = await self._get(
-                "/openApi/swap/v2/quote/depth",
-                {"symbol": symbol, "limit": levels * 2}
-            )
-            bids = data.get("bids", []) if isinstance(data, dict) else []
-            asks = data.get("asks", []) if isinstance(data, dict) else []
-            bid_q = sum(float(b[1]) for b in bids[:levels] if len(b) >= 2)
-            ask_q = sum(float(a[1]) for a in asks[:levels] if len(a) >= 2)
+            data = await self._get("/openApi/swap/v2/quote/depth",
+                                   {"symbol": symbol, "limit": levels * 2})
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            bid_q = sum(float(b[1]) for b in bids[:levels])
+            ask_q = sum(float(a[1]) for a in asks[:levels])
             total = bid_q + ask_q
             if total == 0:
                 return 0.0
@@ -166,19 +104,15 @@ class BingXClient:
     # ── L14: Funding Rate ────────────────────────────────────
 
     async def get_funding_rate(self, symbol: str) -> float:
+        """
+        Funding rate actual del perpetuo.
+        Positivo = longs pagan (sesgo alcista institucional).
+        """
         try:
-            data = await self._get(
-                "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol}
-            )
+            data = await self._get("/openApi/swap/v2/quote/premiumIndex",
+                                   {"symbol": symbol})
             item = data[0] if isinstance(data, list) else data
-            if not isinstance(item, dict):
-                return 0.0
-            # BingX usa "lastFundingRate" o "fundingRate" según versión
-            for field in ("lastFundingRate", "fundingRate", "lastFundingRateValue"):
-                val = item.get(field)
-                if val is not None:
-                    return float(val)
-            return 0.0
+            return float(item.get("lastFundingRate", 0))
         except Exception as e:
             log.debug(f"get_funding_rate {symbol}: {e}")
             return 0.0
@@ -186,23 +120,20 @@ class BingXClient:
     # ── L15: Open Interest ───────────────────────────────────
 
     async def get_open_interest(self, symbol: str) -> float:
+        """Open Interest actual en contratos."""
         try:
-            data = await self._get(
-                "/openApi/swap/v2/quote/openInterest", {"symbol": symbol}
-            )
+            data = await self._get("/openApi/swap/v2/quote/openInterest",
+                                   {"symbol": symbol})
             item = data[0] if isinstance(data, list) else data
-            if not isinstance(item, dict):
-                return 0.0
-            for field in ("openInterest", "openInterestValue", "openInterestAmt"):
-                val = item.get(field)
-                if val is not None:
-                    return float(val)
-            return 0.0
+            return float(item.get("openInterest", 0))
         except Exception as e:
             log.debug(f"get_open_interest {symbol}: {e}")
             return 0.0
 
     async def get_market_context(self, symbol: str, ofi_levels: int = 5) -> dict:
+        """
+        Fetch OFI + Funding Rate + OI en paralelo (una sola función).
+        """
         ofi, fr, oi = await asyncio.gather(
             self.get_ofi(symbol, ofi_levels),
             self.get_funding_rate(symbol),
@@ -217,66 +148,37 @@ class BingXClient:
 
     # ── Account ─────────────────────────────────────────────
 
-    async def get_balance(self) -> float:
-        """Devuelve el availableMargin en USDT. Nunca lanza excepción."""
-        try:
-            data = await self._get(
-                "/openApi/swap/v2/user/balance", signed=True
-            )
-            # BingX puede devolver {"balance": [...]} o directamente [...]
-            if isinstance(data, list):
-                balances = data
-            elif isinstance(data, dict):
-                balances = data.get("balance", [])
-                if not balances:
-                    # Intentar otras claves
-                    for key in ("balances", "assets", "result"):
-                        if isinstance(data.get(key), list):
-                            balances = data[key]
-                            break
-            else:
-                log.warning(f"get_balance: tipo inesperado {type(data)}: {data}")
-                return 0.0
-
-            for a in balances:
-                if not isinstance(a, dict):
-                    continue
-                asset = a.get("asset", a.get("currency", ""))
-                if asset == "USDT":
-                    for field in ("availableMargin", "available", "free", "balance"):
-                        val = a.get(field)
-                        if val is not None:
-                            return float(val)
-            return 0.0
-        except Exception as e:
-            log.error(f"get_balance error: {e}")
-            return 0.0
+    async def get_balance(self):
+        data = await self._get("/openApi/swap/v2/user/balance", signed=True)
+        for a in data.get("balance", []):
+            if a.get("asset") == "USDT":
+                return float(a.get("availableMargin", 0))
+        return 0.0
 
     async def get_positions(self, symbol=""):
-        try:
-            p = {"symbol": symbol} if symbol else {}
-            data = await self._get(
-                "/openApi/swap/v2/user/positions", p, signed=True
-            )
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            log.error(f"get_positions {symbol}: {e}")
-            return []
+        p = {"symbol": symbol} if symbol else {}
+        data = await self._get("/openApi/swap/v2/user/positions", p, signed=True)
+        return data if isinstance(data, list) else []
 
     async def set_leverage(self, symbol, leverage, side="LONG"):
         try:
-            await self._post(
-                "/openApi/swap/v2/trade/leverage",
-                {"symbol": symbol, "leverage": leverage, "side": side}
-            )
+            await self._post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "leverage": leverage, "side": side})
         except Exception as e:
             log.warning(f"set_leverage {symbol}: {e}")
 
     # ── Orders ───────────────────────────────────────────────
 
-    async def place_order(self, symbol, side, size, leverage, sl_price,
-                          tp_price=None, use_maker=True, maker_timeout=30,
-                          maker_offset_pct=0.02):
+    async def place_order(self, symbol, side, size, leverage, sl_price, tp_price=None,
+                          use_maker=True, maker_timeout=30, maker_offset_pct=0.02):
+        """
+        Coloca orden. Si use_maker=True intenta LIMIT post-only primero.
+        Si no llena en maker_timeout segundos, cancela y cae a MARKET.
+
+        Fees:
+          MARKET (taker) = 0.075% × 2 lados = 0.15% round-trip
+          LIMIT maker    = 0.02%  × 2 lados = 0.04% round-trip  (−73%)
+        """
         await self.set_leverage(symbol, leverage, side)
         await asyncio.sleep(0.2)
 
@@ -291,20 +193,19 @@ class BingXClient:
                 return order
             log.info(f"[{symbol}] Maker no llenó — fallback a MARKET")
 
-        return await self._place_market(
-            symbol, bingx_side, side, size, sl_price, tp_price
-        )
+        # MARKET fallback
+        return await self._place_market(symbol, bingx_side, side, size, sl_price, tp_price)
 
     async def _place_maker(self, symbol, bingx_side, pos_side, size,
                            sl_price, tp_price, timeout, offset_pct):
+        """Limit post-only. Devuelve None si no llena en timeout."""
         try:
             ticker = await self.get_ticker(symbol)
-            if ticker["ask"] == 0 and ticker["bid"] == 0:
-                return None
-
             if bingx_side == "BUY":
+                # Comprar: limite ligeramente por debajo del ask actual
                 limit_price = round(ticker["ask"] * (1 - offset_pct / 100), 6)
             else:
+                # Vender: limite ligeramente por encima del bid actual
                 limit_price = round(ticker["bid"] * (1 + offset_pct / 100), 6)
 
             params = {
@@ -322,14 +223,13 @@ class BingXClient:
                 params["takeProfitPrice"] = f"{tp_price:.6f}"
 
             data = await self._post("/openApi/swap/v2/trade/order", params)
-            if not isinstance(data, dict):
-                return None
-            order_id = (data.get("order", {}) or {}).get("orderId") or data.get("orderId")
+            order_id = data.get("order", {}).get("orderId") or data.get("orderId")
             if not order_id:
                 return None
 
             log.info(f"[{symbol}] Maker order {order_id} @ {limit_price}")
 
+            # Esperar llenado
             for _ in range(timeout):
                 await asyncio.sleep(1)
                 status = await self._get_order_status(symbol, order_id)
@@ -339,6 +239,7 @@ class BingXClient:
                 if status in ("CANCELLED", "EXPIRED", "REJECTED"):
                     return None
 
+            # Timeout → cancelar
             await self._cancel_order(symbol, order_id)
             return None
 
@@ -346,8 +247,7 @@ class BingXClient:
             log.warning(f"[{symbol}] _place_maker: {e}")
             return None
 
-    async def _place_market(self, symbol, bingx_side, pos_side, size,
-                            sl_price, tp_price):
+    async def _place_market(self, symbol, bingx_side, pos_side, size, sl_price, tp_price):
         params = {
             "symbol"      : symbol,
             "side"        : bingx_side,
@@ -369,48 +269,39 @@ class BingXClient:
 
     async def _get_order_status(self, symbol: str, order_id: str) -> str:
         try:
-            data = await self._get(
-                "/openApi/swap/v2/trade/order",
-                {"symbol": symbol, "orderId": order_id},
-                signed=True
-            )
+            data = await self._get("/openApi/swap/v2/trade/order",
+                                   {"symbol": symbol, "orderId": order_id}, signed=True)
             order = data[0] if isinstance(data, list) else data
-            if isinstance(order, dict):
-                return order.get("status", "UNKNOWN")
-            return "UNKNOWN"
+            return order.get("status", "UNKNOWN")
         except Exception:
             return "UNKNOWN"
 
     async def _cancel_order(self, symbol: str, order_id: str):
         try:
-            await self._post(
-                "/openApi/swap/v2/trade/cancelOrder",
-                {"symbol": symbol, "orderId": order_id}
-            )
+            await self._post("/openApi/swap/v2/trade/cancelOrder",
+                             {"symbol": symbol, "orderId": order_id})
             log.info(f"[{symbol}] Orden {order_id} cancelada")
         except Exception as e:
             log.warning(f"_cancel_order {symbol}: {e}")
 
     async def close_position(self, symbol, side):
+        positions = await self.get_positions(symbol)
+        size = 0.0
+        for p in positions:
+            if p.get("positionSide") == side and float(p.get("positionAmt", 0)) != 0:
+                size = abs(float(p["positionAmt"]))
+                break
+        if size == 0:
+            return None
+        params = {
+            "symbol"      : symbol,
+            "side"        : "SELL" if side == "LONG" else "BUY",
+            "positionSide": side,
+            "type"        : "MARKET",
+            "quantity"    : f"{size:.4f}",
+            "reduceOnly"  : "true",
+        }
         try:
-            positions = await self.get_positions(symbol)
-            size = 0.0
-            for p in positions:
-                if (isinstance(p, dict)
-                        and p.get("positionSide") == side
-                        and float(p.get("positionAmt", 0)) != 0):
-                    size = abs(float(p["positionAmt"]))
-                    break
-            if size == 0:
-                return None
-            params = {
-                "symbol"      : symbol,
-                "side"        : "SELL" if side == "LONG" else "BUY",
-                "positionSide": side,
-                "type"        : "MARKET",
-                "quantity"    : f"{size:.4f}",
-                "reduceOnly"  : "true",
-            }
             return await self._post("/openApi/swap/v2/trade/order", params)
         except Exception as e:
             log.error(f"close_position {symbol}: {e}")
