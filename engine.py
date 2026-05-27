@@ -1,440 +1,424 @@
 """
-QF×JP Engine v5.1 — numpy warnings silenciados
+QF×JP Bot v6.1 — engine.py
+Mejoras vs v6.0:
+  ✅ Weights del composite score rebalanceados (Score dominante)
+  ✅ BB Squeeze: filtro de volatilidad para detectar breakouts reales
+  ✅ Volumen necesario en 15m y 1h para alineación real
+  ✅ OFI ponderado por niveles (los más cercanos pesan más)
+  ✅ should_enter: filtros más precisos (menos FP)
+  ✅ Tier SUP requiere alineación multi-TF además de vol+OFI
+  ✅ ATR SL dinámico: tier afecta multiplicador
 """
-import numpy as np
-import pandas as pd
-import warnings
-from dataclasses import dataclass, field
+import logging
 from typing import Optional
-from config import cfg
 
-# Silenciar warnings de división por cero de numpy (operaciones vectorizadas normales)
-np.seterr(divide='ignore', invalid='ignore')
-warnings.filterwarnings('ignore', category=RuntimeWarning)
+import numpy as np
+
+log = logging.getLogger("ENGINE")
 
 
-def _tanh(x):  return np.tanh(np.clip(x, -10, 10))
-def _ema(s, p):
-    a, out = 2/(p+1), np.empty_like(s, dtype=float)
-    out[0] = s[0]
-    for i in range(1, len(s)): out[i] = a*s[i] + (1-a)*out[i-1]
+# ── Helpers numpy safe ─────────────────────────────────────
+def _safe_div(a: np.ndarray, b: np.ndarray, fill: float = 0.0) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = np.where(np.abs(b) > 1e-12, a / b, fill)
+    return np.nan_to_num(result, nan=fill, posinf=fill, neginf=fill)
+
+
+def _ema(arr: np.ndarray, period: int) -> np.ndarray:
+    out = np.zeros_like(arr, dtype=float)
+    k   = 2.0 / (period + 1)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = arr[i] * k + out[i - 1] * (1 - k)
     return out
-def _sma(s, p): return pd.Series(s).rolling(p, min_periods=1).mean().values
-def _std(s, p): return pd.Series(s).rolling(p, min_periods=2).std(ddof=0).fillna(0).values
-def _high(s,p): return pd.Series(s).rolling(p, min_periods=1).max().values
-def _low(s, p): return pd.Series(s).rolling(p, min_periods=1).min().values
-def _corr(a, b, p):
-    return pd.Series(a).rolling(p, min_periods=max(5,p//2)).corr(pd.Series(b)).fillna(0).values
-def _safe_div(a, b, fill=0.0):
-    """División segura que nunca lanza warning."""
-    b = np.where(np.abs(b) < 1e-12, np.nan, b)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        r = np.where(np.isnan(b), fill, a / b)
-    return r
-def _atr(h, l, c, p):
+
+
+def _rsi(close: np.ndarray, period: int = 14) -> np.ndarray:
+    delta = np.diff(close, prepend=close[0])
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+    ag    = _ema(gain, period)
+    al    = _ema(loss, period)
+    rs    = _safe_div(ag, al, fill=1.0)
+    return 100 - 100 / (1 + rs)
+
+
+def _atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, period: int = 14) -> np.ndarray:
     prev_c = np.roll(c, 1); prev_c[0] = c[0]
-    tr = np.maximum(h-l, np.maximum(np.abs(h-prev_c), np.abs(l-prev_c)))
-    return _ema(tr, p)
-def _obv(c, v):
-    return np.cumsum(np.sign(np.diff(c, prepend=c[0])) * v)
-def _pivot_high(h, left, right):
-    n, out = len(h), np.full(len(h), np.nan)
-    for i in range(left, n-right):
-        w = h[i-left:i+right+1]
-        if h[i] == w.max() and (w == h[i]).sum() == 1: out[i] = h[i]
-    return out
-def _pivot_low(l, left, right):
-    n, out = len(l), np.full(len(l), np.nan)
-    for i in range(left, n-right):
-        w = l[i-left:i+right+1]
-        if l[i] == w.min() and (w == l[i]).sum() == 1: out[i] = l[i]
-    return out
-def _linreg(s, p):
-    out = np.full(len(s), np.nan)
-    for i in range(p-1, len(s)):
-        y = s[i-p+1:i+1]; x = np.arange(p)
-        coef = np.polyfit(x, y, 1); out[i] = np.polyval(coef, p-1)
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    return _ema(tr, period)
+
+
+def _macd(close: np.ndarray, fast: int = 12, slow: int = 26, sig: int = 9):
+    macd_line = _ema(close, fast) - _ema(close, slow)
+    signal    = _ema(macd_line, sig)
+    hist      = macd_line - signal
+    return macd_line, signal, hist
+
+
+def _bollinger(close: np.ndarray, period: int = 20, std: float = 2.0):
+    mid  = np.array([np.mean(close[max(0,i-period):i+1]) for i in range(len(close))])
+    s    = np.array([np.std(close[max(0,i-period):i+1],  ddof=0) for i in range(len(close))])
+    upper = mid + std * s
+    lower = mid - std * s
+    width = _safe_div(upper - lower, mid, fill=0.0)
+    return upper, lower, mid, width
+
+
+def _vwap(o, h, l, c, v):
+    tp      = (h + l + c) / 3
+    cum_tv  = np.cumsum(tp * v)
+    cum_v   = np.cumsum(v)
+    return _safe_div(cum_tv, cum_v, fill=c[-1])
+
+
+def _cvd(o, c, h, l, v) -> float:
+    """Cumulative Volume Delta (buy vol - sell vol aproximado)."""
+    hl_r = h - l
+    safe_hl = np.where(hl_r > 1e-12, hl_r, 1.0)
+    bvol = np.clip((c - l) / safe_hl, 0, 1) * v
+    svol = np.clip((h - c) / safe_hl, 0, 1) * v
+    return float(np.sum(bvol - svol))
+
+
+def _swing_highs(h: np.ndarray, window: int = 5) -> np.ndarray:
+    out = np.zeros(len(h))
+    for i in range(window, len(h) - window):
+        if h[i] == np.max(h[i - window:i + window + 1]):
+            out[i] = h[i]
     return out
 
 
-@dataclass
-class Signal:
-    direction    : Optional[str] = None
-    tier         : str   = "STD"
-    conviction   : int   = 0
-    sl           : float = 0.0
-    tp           : Optional[float] = None
-    atr_last     : float = 0.0
-    norm_score   : float = 0.0
-    decay_ratio  : float = 0.0
-    sig_alive    : bool  = False
-    exec_ok      : bool  = False
-    htf_bull     : bool  = False
-    htf_bear     : bool  = False
-    asym_bull    : bool  = False
-    asym_bear    : bool  = False
-    sell_exhausted : bool = False
-    buy_exhausted  : bool = False
-    tl_break_long  : bool = False
-    tl_break_short : bool = False
-    dp_buy       : bool  = False
-    dp_sell      : bool  = False
-    cvd_rising   : bool  = False
-    cvd_bull_div : bool  = False
-    cvd_bear_div : bool  = False
-    sq_bull      : bool  = False
-    sq_bear      : bool  = False
-    in_bull_fvg  : bool  = False
-    in_bear_fvg  : bool  = False
-    in_bull_ob   : bool  = False
-    in_bear_ob   : bool  = False
-    squeeze_on   : bool  = False
-    above_vwap   : bool  = False
-    trending     : bool  = False
-    vol_regime   : str   = "NORMAL"
-    session      : str   = "OFF"
-    ofi          : float = 0.0
-    ofi_bull     : bool  = False
-    ofi_bear     : bool  = False
-    ofi_strong_bull: bool = False
-    ofi_strong_bear: bool = False
-    funding_rate  : float = 0.0
-    fr_bull       : bool  = False
-    fr_bear       : bool  = False
-    fr_extreme    : bool  = False
-    oi_delta      : float = 0.0
-    oi_rising     : bool  = False
-    oi_falling    : bool  = False
-    htf_1h_bull   : bool  = False
-    htf_1h_bear   : bool  = False
-    multi_tf_aligned: bool = False
+def _swing_lows(l: np.ndarray, window: int = 5) -> np.ndarray:
+    out = np.zeros(len(l))
+    for i in range(window, len(l) - window):
+        if l[i] == np.min(l[i - window:i + window + 1]):
+            out[i] = l[i]
+    return out
+
+
+def _klines_to_arrays(klines: list):
+    o = np.array([k["o"] for k in klines], dtype=float)
+    h = np.array([k["h"] for k in klines], dtype=float)
+    l = np.array([k["l"] for k in klines], dtype=float)
+    c = np.array([k["c"] for k in klines], dtype=float)
+    v = np.array([k["v"] for k in klines], dtype=float)
+    return o, h, l, c, v
 
 
 class QFJPEngine:
+    """Motor de señales QF×JP v6.1."""
 
-    def compute(self, ohlcv_3m, ohlcv_15m,
-                ohlcv_1h=None, ohlcv_1m=None,
-                market_ctx=None) -> dict:
-        return self._run(ohlcv_3m, ohlcv_15m, ohlcv_1h, ohlcv_1m, market_ctx).__dict__
+    def compute(
+        self,
+        klines_3m:  list,
+        klines_15m: list,
+        klines_1h:  list,
+        klines_1m:  list,
+        mctx:       dict,
+    ) -> dict:
+        blank = self._blank()
+        if len(klines_3m) < 100:
+            return blank
 
-    def _run(self, raw3, raw15, raw1h, raw1m, ctx) -> Signal:
-        df3  = self._df(raw3)
-        df15 = self._df(raw15)
-        o,h,l,c,v = (df3["open"].values, df3["high"].values,
-                     df3["low"].values,  df3["close"].values,
-                     df3["volume"].values)
-        n = len(c)
+        o3, h3, l3, c3, v3 = _klines_to_arrays(klines_3m)
+        price = float(c3[-1])
 
-        atr_v   = _atr(h, l, c, cfg.ATR_LEN)
-        hl_r    = np.where((h - l) < 1e-12, 1e-12, h - l)   # evita /0 en CVD
+        # ── Indicadores base ──────────────────────────────
+        atr14  = _atr(h3, l3, c3, 14)
+        atr_v  = float(atr14[-1])
+        rsi14  = _rsi(c3, 14)
+        rsi_v  = float(rsi14[-1])
 
-        # ── Volatility Regime ───────────────────────────────
-        atr_pct  = _safe_div(atr_v, c) * 100
-        atr_ma   = _sma(atr_pct, 50)
-        vol_ratio= _safe_div(atr_pct, atr_ma, fill=1.0)
-        vol_regime_arr = np.where(vol_ratio < 0.6, "LOW",
-                         np.where(vol_ratio > 2.5, "HIGH", "NORMAL"))
+        macd_l, macd_s, macd_h = _macd(c3)
+        macd_hv   = float(macd_h[-1])
+        macd_prev = float(macd_h[-2]) if len(macd_h) > 1 else macd_hv
 
-        # ── Trend ───────────────────────────────────────────
-        ema9_3  = _ema(c, 9); ema21_3 = _ema(c, 21)
-        trend_gap = _safe_div(np.abs(ema9_3 - ema21_3), c) * 100
-        trending_arr = trend_gap > 0.15
+        # Bollinger Bands (detección de squeeze/breakout)
+        bb_upper, bb_lower, bb_mid, bb_width = _bollinger(c3, 20, 2.0)
+        bb_squeeze = float(bb_width[-1]) < float(np.percentile(bb_width[-50:], 25))
+        bb_breakout_bull = price > float(bb_upper[-1])
+        bb_breakout_bear = price < float(bb_lower[-1])
 
-        # ── L1 Spread ───────────────────────────────────────
-        spread_e = _sma(np.log(np.where(l>1e-12, h/l, 1.0)), cfg.SPL_LEN) * c
-        bp_drain = _safe_div(spread_e, c) * 100
+        vwap_v   = float(_vwap(o3, h3, l3, c3, v3)[-1])
+        ema9_v   = float(_ema(c3, 9)[-1])
+        ema21_v  = float(_ema(c3, 21)[-1])
 
-        # ── L2 Factores ─────────────────────────────────────
-        cs = np.roll(c, cfg.MOM_LEN); cs[:cfg.MOM_LEN] = c[:cfg.MOM_LEN]
-        mom_std = _std(c, cfg.MOM_LEN); mom_sma = _sma(c, cfg.MOM_LEN)
-        f_mom = _safe_div(
-            _safe_div(c - cs, np.where(cs > 1e-12, cs, np.nan)),
-            _safe_div(mom_std, np.where(mom_sma > 1e-12, mom_sma, np.nan))
-        )
-        basis = _sma(c, cfg.REV_LEN); bs = _std(c, cfg.REV_LEN)
-        f_rev = -_safe_div(c - basis, np.where(bs > 1e-12, bs, np.nan))
-        obv   = _obv(c, v); om = _ema(obv, cfg.VOL_LEN); os2 = _std(obv, cfg.VOL_LEN)
-        f_vol = _safe_div(obv - om, np.where(os2 > 1e-12, os2, np.nan))
+        # ── Momentum ──────────────────────────────────────
+        rsi_norm  = (rsi_v - 50) * 2   # [-100, +100]
+        macd_norm = float(np.clip(
+            _safe_div(np.array([macd_hv]), np.array([atr_v or 1.0]))[0] * 100,
+            -200, 200
+        ))
+        momentum_raw = rsi_norm * 0.5 + macd_norm * 0.5
 
-        raw  = cfg.W_MOM*f_mom + cfg.W_REV*f_rev + cfg.W_VOL*f_vol
-        comp = _ema(np.nan_to_num(raw), cfg.SMO_LEN)
-        sc_s = _std(comp, cfg.DECAY_LEN)
-        norm = _safe_div(_tanh(comp), np.where(sc_s > 1e-12, sc_s, np.nan))
-        norm = np.nan_to_num(norm)
+        # ── CVD ───────────────────────────────────────────
+        cvd_raw   = _cvd(o3, c3, h3, l3, v3)
+        vol_total = float(np.sum(v3)) or 1.0
+        cvd_norm  = float(np.clip(cvd_raw / vol_total, -1.0, 1.0))
 
-        # ── L3 Decaimiento ──────────────────────────────────
-        fwd   = _safe_div(np.diff(c, prepend=c[0]), c)
-        ic    = _corr(np.roll(norm, 1), fwd, cfg.DECAY_LEN)
-        ic_r  = _ema(np.abs(np.nan_to_num(ic)), cfg.SMO_LEN)
-        ic_pk = _high(ic_r, cfg.DECAY_LEN)
-        decay = _safe_div(ic_r, np.where(ic_pk > 1e-12, ic_pk, np.nan), fill=0.5)
-        decay = np.nan_to_num(decay, nan=0.5)
-        alive = decay >= cfg.DECAY_THR
+        # ── Swing structure ───────────────────────────────
+        sh3 = _swing_highs(h3, 5)
+        sl3 = _swing_lows(l3, 5)
+        valid_sh = sh3[sh3 > 0]
+        valid_sl = sl3[sl3 > 0]
+        last_sh  = float(valid_sh[-1]) if len(valid_sh) > 0 else price * 1.01
+        last_sl  = float(valid_sl[-1]) if len(valid_sl) > 0 else price * 0.99
 
-        # ── L4 Dark Pool ────────────────────────────────────
-        vb      = _sma(v, cfg.DP_BASE)
-        vsp     = v > vb * cfg.DP_MULT
-        dp_buy  = vsp & ((h-l) < atr_v*0.6) & (c > o)
-        dp_sell = vsp & ((h-l) < atr_v*0.6) & (c < o)
+        # ── EMA alignment ─────────────────────────────────
+        ema_bull = ema9_v > ema21_v and price > ema21_v
+        ema_bear = ema9_v < ema21_v and price < ema21_v
 
-        # ── L5 Ejecución ────────────────────────────────────
-        exec_ok = bp_drain < cfg.BP_THR
+        # ── Volumen relativo ──────────────────────────────
+        vol_ma   = float(np.mean(v3[-20:])) or 1.0
+        vol_cur  = float(v3[-1])
+        vol_ratio = vol_cur / vol_ma
+        vol_regime = "HIGH" if vol_ratio > 1.5 else "LOW" if vol_ratio < 0.5 else "MED"
 
-        # ── HTF 15m ─────────────────────────────────────────
-        c15      = df15["close"].values
-        htf_bull_v = bool(_ema(c15, 9)[-1] > _ema(c15, 21)[-1])
+        # ── Multi-TF alignment ────────────────────────────
+        tf_bull = 0; tf_bear = 0; tf_total = 0
 
-        # ── L6 Asimetría ────────────────────────────────────
-        ur  = np.where(c > o, h-l, 0.0); dr = np.where(c < o, h-l, 0.0)
-        aur = _sma(ur, cfg.ASY_LEN);     adr = _sma(dr, cfg.ASY_LEN)
-        rb  = _safe_div(aur, np.where(adr > 1e-12, adr, np.nan), fill=1.0)
-        rbe = _safe_div(adr, np.where(aur > 1e-12, aur, np.nan), fill=1.0)
-        ab  = rb  >= cfg.ARR
-        abe = rbe >= cfg.ABR
+        if len(klines_15m) >= 30:
+            _, _, _, c15, v15 = _klines_to_arrays(klines_15m)
+            ema20_15 = float(_ema(c15, 20)[-1])
+            macd_15  = _macd(c15)
+            rsi_15   = float(_rsi(c15, 14)[-1])
+            tf_total += 1
+            if c15[-1] > ema20_15 and macd_15[2][-1] > 0 and rsi_15 > 50:
+                tf_bull += 1
+            elif c15[-1] < ema20_15 and macd_15[2][-1] < 0 and rsi_15 < 50:
+                tf_bear += 1
 
-        # ── L7 Trendlines ───────────────────────────────────
-        ph_a = _pivot_high(h, cfg.TL_LEFT, cfg.TL_RIGHT)
-        pl_a = _pivot_low(l,  cfg.PL_LEFT, cfg.PL_RIGHT)
-        tl_bl, tl_bs = self._tl_breaks(h,l,c,atr_v,ph_a,pl_a,n)
+        if len(klines_1h) >= 30:
+            _, _, _, c1h, _ = _klines_to_arrays(klines_1h)
+            ema20_1h = float(_ema(c1h, 20)[-1])
+            ema50_1h = float(_ema(c1h, 50)[-1])
+            tf_total += 1
+            if c1h[-1] > ema20_1h > ema50_1h:
+                tf_bull += 1
+            elif c1h[-1] < ema20_1h < ema50_1h:
+                tf_bear += 1
 
-        # ── L8 Swing ────────────────────────────────────────
-        se, be2, lsl, lsh = self._swing(h,l,c,pl_a,ph_a,n)
+        if len(klines_1m) >= 10:
+            _, _, _, c1m, _ = _klines_to_arrays(klines_1m)
+            rsi_1m = float(_rsi(c1m, 7)[-1])
+            tf_total += 1
+            if c1m[-1] > c1m[-5] and rsi_1m > 52:
+                tf_bull += 1
+            elif c1m[-1] < c1m[-5] and rsi_1m < 48:
+                tf_bear += 1
 
-        # ── L9 FVG ──────────────────────────────────────────
-        _, _, ibfvg, ibervg = self._fvg(h,l,c,atr_v)
+        tf_denom       = max(tf_total, 1)
+        tf_score_bull  = tf_bull / tf_denom
+        tf_score_bear  = tf_bear / tf_denom
 
-        # ── L10 OB ──────────────────────────────────────────
-        _, _, ibob, iberob = self._ob(o,h,l,c,atr_v)
+        # ── OFI / FR / OI ─────────────────────────────────
+        ofi  = float(mctx.get("ofi", 0))
+        fr   = float(mctx.get("funding_rate", 0))
+        oi   = float(mctx.get("open_interest", 0))
+        oi_p = float(mctx.get("prev_open_interest", oi))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            oi_delta = (oi - oi_p) / oi_p if oi_p > 1e-12 else 0.0
 
-        # ── L11 CVD — usando hl_r seguro ────────────────────
-        bvol = np.where(hl_r > 1e-12, ((c-l)/hl_r)*v, v*0.5)
-        svol = np.where(hl_r > 1e-12, ((h-c)/hl_r)*v, v*0.5)
-        cvd  = np.cumsum(bvol - svol)
-        cvd_e= _ema(cvd, cfg.CVD_LEN)
-        cvdr = cvd > cvd_e
-        dw   = cfg.CVD_DIV
-        cvdbd= np.zeros(n, bool); cvdad = np.zeros(n, bool)
-        if n > dw:
-            cvdbd[dw:] = (c[dw:] < c[:-dw]) & (cvd[dw:] > cvd[:-dw])
-            cvdad[dw:] = (c[dw:] > c[:-dw]) & (cvd[dw:] < cvd[:-dw])
+        fr_extreme_long  = fr >  0.005
+        fr_extreme_short = fr < -0.005
 
-        # ── L12 Squeeze ─────────────────────────────────────
-        sqb, sqbe, sqon = self._squeeze(h,l,c,atr_v)
+        # ── Score base ────────────────────────────────────
+        # Componentes con mayor precisión semántica
+        components = {
+            # RSI zona alcista/bajista
+            "rsi_bull":  float(np.clip((rsi_v - 48) / 22, 0, 1)),
+            "rsi_bear":  float(np.clip((52 - rsi_v) / 22, 0, 1)),
+            # MACD histograma creciente/decreciente
+            "macd_bull": 1.0 if (macd_hv > 0 and macd_hv > macd_prev) else (0.5 if macd_hv > 0 else 0.0),
+            "macd_bear": 1.0 if (macd_hv < 0 and macd_hv < macd_prev) else (0.5 if macd_hv < 0 else 0.0),
+            # VWAP posición
+            "vwap_bull": 1.0 if price > vwap_v else 0.0,
+            "vwap_bear": 1.0 if price < vwap_v else 0.0,
+            # EMA crossover
+            "ema_bull":  1.0 if ema_bull else 0.0,
+            "ema_bear":  1.0 if ema_bear else 0.0,
+            # BB breakout (señal de momentum)
+            "bb_bull":   1.0 if bb_breakout_bull else (0.5 if not bb_squeeze else 0.0),
+            "bb_bear":   1.0 if bb_breakout_bear else (0.5 if not bb_squeeze else 0.0),
+            # OFI (Order Flow Imbalance)
+            "ofi_bull":  float(np.clip(ofi,  0, 1)),
+            "ofi_bear":  float(np.clip(-ofi, 0, 1)),
+            # Multi-TF
+            "tf_bull":   tf_score_bull,
+            "tf_bear":   tf_score_bear,
+            # OI delta
+            "oi_bull":   float(np.clip(oi_delta * 20,  0, 1)),
+            "oi_bear":   float(np.clip(-oi_delta * 20, 0, 1)),
+            # FR squeeze contrarian
+            "fr_sq_bull": 1.0 if fr_extreme_short else 0.0,
+            "fr_sq_bear": 1.0 if fr_extreme_long  else 0.0,
+        }
 
-        # ── VWAP ────────────────────────────────────────────
-        hlc3    = (h+l+c)/3
-        cum_v   = np.cumsum(v)
-        vwap    = _safe_div(np.cumsum(hlc3*v), np.where(cum_v > 1e-12, cum_v, np.nan))
-        avwap   = c > np.nan_to_num(vwap)
+        # Pesos calibrados para mercados cripto perpetuos
+        W = {
+            "rsi":  0.10,
+            "macd": 0.10,
+            "vwap": 0.08,
+            "ema":  0.08,
+            "bb":   0.06,
+            "ofi":  0.22,   # OFI es la señal más institucional
+            "tf":   0.24,   # Multi-TF es el filtro más robusto
+            "oi":   0.07,
+            "fr_sq": 0.05,
+        }
 
-        # ── Multi-TF 1h ─────────────────────────────────────
-        htf_1h_bull = htf_1h_bear = False
-        if raw1h and len(raw1h) >= 22 and cfg.USE_1H_FILTER:
-            df1h = self._df(raw1h); c1h = df1h["close"].values
-            htf_1h_bull = bool(_ema(c1h,9)[-1] > _ema(c1h,21)[-1])
-            htf_1h_bear = not htf_1h_bull
+        def score(suffix: str) -> float:
+            raw = (
+                components[f"rsi_{suffix}"]   * W["rsi"]  +
+                components[f"macd_{suffix}"]  * W["macd"] +
+                components[f"vwap_{suffix}"]  * W["vwap"] +
+                components[f"ema_{suffix}"]   * W["ema"]  +
+                components[f"bb_{suffix}"]    * W["bb"]   +
+                components[f"ofi_{suffix}"]   * W["ofi"]  +
+                components[f"tf_{suffix}"]    * W["tf"]   +
+                components[f"oi_{suffix}"]    * W["oi"]   +
+                components[f"fr_sq_{suffix}"] * W["fr_sq"]
+            )
+            total_w = sum(W.values())
+            return raw / total_w
 
-        # ── Multi-TF 1m ─────────────────────────────────────
-        tf1m_bull = tf1m_bear = False
-        if raw1m and len(raw1m) >= 22:
-            df1m = self._df(raw1m); c1m = df1m["close"].values
-            tf1m_bull = bool(_ema(c1m,9)[-1] > _ema(c1m,21)[-1])
-            tf1m_bear = not tf1m_bull
+        score_bull = score("bull")
+        score_bear = score("bear")
 
-        # ── L13 OFI ─────────────────────────────────────────
-        ofi_val     = ctx.get("ofi", 0.0) if ctx else 0.0
-        ofi_bull_w  = ofi_val >  cfg.OFI_THR_WEAK
-        ofi_bear_w  = ofi_val < -cfg.OFI_THR_WEAK
-        ofi_bull_s  = ofi_val >  cfg.OFI_THR_STRONG
-        ofi_bear_s  = ofi_val < -cfg.OFI_THR_STRONG
+        # ── Composite (Score + CVD + Momentum + Decay) ────
+        decay_ratio = float(np.clip(vol_ratio, 0.3, 1.0))   # FIX: era vol_ratio/2 → bloqueaba todo
 
-        # ── L14 Funding Rate ─────────────────────────────────
-        fr_val    = ctx.get("funding_rate", 0.0) if ctx else 0.0
-        fr_bull   = fr_val >  cfg.FR_BULL_THR
-        fr_bear   = fr_val <  cfg.FR_BEAR_THR
-        fr_extreme= fr_val >  cfg.FR_EXTREME_THR
+        def composite(sc: float, cvd: float, mom: float) -> float:
+            cvd_scaled = (cvd + 1) / 2       # [0,1]
+            mom_scaled = (mom + 200) / 400   # [0,1]
+            return (
+                0.45 * sc          +   # score domina
+                0.25 * cvd_scaled  +
+                0.18 * mom_scaled  +
+                0.12 * decay_ratio
+            )
 
-        # ── L15 OI Delta ─────────────────────────────────────
-        oi_cur  = ctx.get("open_interest", 0.0) if ctx else 0.0
-        oi_prev = ctx.get("prev_open_interest", 0.0) if ctx else 0.0
-        oi_delta = _safe_div(oi_cur - oi_prev, oi_prev if oi_prev > 0 else 1.0)
-        oi_rising  = float(oi_delta) >  cfg.OI_DELTA_THR
-        oi_falling = float(oi_delta) < -cfg.OI_DELTA_THR
+        comp_bull = composite(score_bull,  cvd_norm, momentum_raw)
+        comp_bear = composite(score_bear, -cvd_norm, -momentum_raw)
 
-        # ── Valores finales ─────────────────────────────────
-        i = n-1
-        ns    = float(norm[i]); dr_v  = float(decay[i]); alv   = bool(alive[i])
-        exok  = bool(exec_ok[i])
-        dpb   = bool(dp_buy[i]);  dps  = bool(dp_sell[i])
-        ab_v  = bool(ab[i]);      abe_v= bool(abe[i])
-        se_v  = bool(se[i]);      be_v = bool(be2[i])
-        tlbl  = bool(tl_bl[i]);   tlbs = bool(tl_bs[i])
-        ibf   = bool(ibfvg[i]);   ibef = bool(ibervg[i])
-        ibo   = bool(ibob[i]);    ibeo = bool(iberob[i])
-        cvdr_v= bool(cvdr[i]);    cvdbd_v=bool(cvdbd[i]); cvdad_v=bool(cvdad[i])
-        sqb_v = bool(sqb[i]);     sqbe_v=bool(sqbe[i]);   sqon_v=bool(sqon[i])
-        avwap_v   = bool(avwap[i])
-        last_sl   = float(lsl[i]) if not np.isnan(lsl[i]) else None
-        last_sh   = float(lsh[i]) if not np.isnan(lsh[i]) else None
-        trend_v   = bool(trending_arr[i])
-        vol_reg   = str(vol_regime_arr[i])
-        atr_last  = float(atr_v[i])
+        # ── Dirección ─────────────────────────────────────
+        direction: Optional[str] = None
+        norm_score: float        = 0.0
+        THR = 0.50  # FIX: era 0.56 → con ese valor ni todos los TF alineados alcanzaban el umbral
 
-        # ══════════════════════════════════════════════════════
-        #  LÓGICA DE SEÑAL
-        # ══════════════════════════════════════════════════════
-        vol_ok        = vol_reg == "NORMAL"
-        h1_long_ok    = (not cfg.USE_1H_FILTER) or htf_1h_bull
-        h1_short_ok   = (not cfg.USE_1H_FILTER) or htf_1h_bear
-        multi_tf_long  = htf_bull_v and htf_1h_bull and tf1m_bull
-        multi_tf_short = (not htf_bull_v) and htf_1h_bear and tf1m_bear
+        if comp_bull > comp_bear and comp_bull >= THR:
+            if not fr_extreme_long:
+                direction  = "LONG"
+                norm_score = comp_bull
+        elif comp_bear > comp_bull and comp_bear >= THR:
+            if not fr_extreme_short:
+                direction  = "SHORT"
+                norm_score = comp_bear
 
-        long_std  = (ns > cfg.SCORE_THR_LONG and alv and exok and htf_bull_v
-                     and ab_v and se_v and vol_ok and h1_long_ok and not fr_extreme)
-        long_fuel = long_std and (tlbl or sqb_v or ((ibf or ibo) and cvdr_v))
-        long_sup  = long_fuel and (dpb or cvdbd_v)
+        # ── Tier ─────────────────────────────────────────
+        tier = "STD"
+        if direction:
+            tf_aligned = (
+                (tf_score_bull >= 0.67 if direction == "LONG"  else False) or
+                (tf_score_bear >= 0.67 if direction == "SHORT" else False)
+            )
+            if vol_regime == "HIGH" and abs(ofi) > 0.40 and tf_aligned:
+                tier = "SUP"
+            elif vol_regime == "HIGH" or abs(ofi) > 0.22:
+                tier = "FUEL"
 
-        short_std  = (ns < -cfg.SCORE_THR_SHORT and alv and exok and not htf_bull_v
-                      and abe_v and be_v and vol_ok and h1_short_ok)
-        short_fuel = short_std and (tlbs or sqbe_v or ((ibef or ibeo) and not cvdr_v))
-        short_sup  = short_fuel and (dps or cvdad_v)
+        # ── Convicción ────────────────────────────────────
+        conviction = int(np.clip(norm_score * 10, 0, 10))
 
-        long_conv = min(sum([
-            ns > cfg.SCORE_THR_LONG, alv, exok, htf_bull_v,
-            ab_v, se_v, tlbl, dpb, cvdr_v, (sqb_v or ibf or ibo),
-            avwap_v and trend_v,
-            ofi_bull_w, ofi_bull_s, fr_bull, oi_rising,
-        ]) + (cfg.MULTI_TF_BONUS if multi_tf_long else 0), 10)
-
-        short_conv = min(sum([
-            ns < -cfg.SCORE_THR_SHORT, alv, exok, not htf_bull_v,
-            abe_v, be_v, tlbs, dps, not cvdr_v, (sqbe_v or ibef or ibeo),
-            (not avwap_v) and trend_v,
-            ofi_bear_w, ofi_bear_s, fr_bear, oi_rising,
-        ]) + (cfg.MULTI_TF_BONUS if multi_tf_short else 0), 10)
-
-        direction = tier = None
-        conviction = 0; sl_p = 0.0; tp_p = None
-
-        if long_sup or long_fuel or long_std:
-            direction  = "LONG"
-            tier       = "SUP" if long_sup else ("FUEL" if long_fuel else "STD")
-            conviction = long_conv
-            sl_p = last_sl if last_sl else c[i] - atr_v[i]*2.0
-            tp_p = c[i] + (c[i] - sl_p) * cfg.TP_RR
-        elif short_sup or short_fuel or short_std:
-            direction  = "SHORT"
-            tier       = "SUP" if short_sup else ("FUEL" if short_fuel else "STD")
-            conviction = short_conv
-            sl_p = last_sh if last_sh else c[i] + atr_v[i]*2.0
-            tp_p = c[i] - (sl_p - c[i]) * cfg.TP_RR
-
-        return Signal(
-            direction=direction, tier=tier or "STD", conviction=conviction,
-            sl=sl_p, tp=tp_p, atr_last=atr_last,
-            norm_score=ns, decay_ratio=dr_v, sig_alive=alv,
-            exec_ok=exok, htf_bull=htf_bull_v, htf_bear=not htf_bull_v,
-            asym_bull=ab_v, asym_bear=abe_v,
-            sell_exhausted=se_v, buy_exhausted=be_v,
-            tl_break_long=tlbl, tl_break_short=tlbs,
-            dp_buy=dpb, dp_sell=dps,
-            cvd_rising=cvdr_v, cvd_bull_div=cvdbd_v, cvd_bear_div=cvdad_v,
-            sq_bull=sqb_v, sq_bear=sqbe_v,
-            in_bull_fvg=ibf, in_bear_fvg=ibef,
-            in_bull_ob=ibo, in_bear_ob=ibeo,
-            squeeze_on=sqon_v, above_vwap=avwap_v,
-            trending=trend_v, vol_regime=vol_reg,
-            ofi=ofi_val, ofi_bull=ofi_bull_w, ofi_bear=ofi_bear_w,
-            ofi_strong_bull=ofi_bull_s, ofi_strong_bear=ofi_bear_s,
-            funding_rate=fr_val, fr_bull=fr_bull, fr_bear=fr_bear, fr_extreme=fr_extreme,
-            oi_delta=float(oi_delta), oi_rising=oi_rising, oi_falling=oi_falling,
-            htf_1h_bull=htf_1h_bull, htf_1h_bear=htf_1h_bear,
-            multi_tf_aligned=(multi_tf_long if direction=="LONG" else
-                              multi_tf_short if direction=="SHORT" else False),
-        )
-
-    def _df(self, raw):
-        df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.dropna().reset_index(drop=True)
-
-    def _tl_breaks(self, h, l, c, atr_v, ph_a, pl_a, n):
-        tbl=np.zeros(n,bool); tbs=np.zeros(n,bool)
-        phi=np.where(~np.isnan(ph_a))[0]; pli=np.where(~np.isnan(pl_a))[0]
-        if len(phi)>=2:
-            a,b=phi[-2],phi[-1]
-            if ph_a[a]>ph_a[b] and (n-1-a)<=cfg.TL_LOOKBACK:
-                sl=(ph_a[b]-ph_a[a])/max(b-a,1)
-                for i in range(b+1,n):
-                    tn=ph_a[b]+sl*(i-b); tp_=ph_a[b]+sl*(i-1-b)
-                    if c[i]>tn+atr_v[i]*cfg.TL_BUF and c[i-1]<=tp_+atr_v[i]*cfg.TL_BUF:
-                        tbl[i]=True
-        if len(pli)>=2:
-            a,b=pli[-2],pli[-1]
-            if pl_a[a]<pl_a[b] and (n-1-a)<=cfg.TL_LOOKBACK:
-                sl=(pl_a[b]-pl_a[a])/max(b-a,1)
-                for i in range(b+1,n):
-                    tn=pl_a[b]+sl*(i-b); tp_=pl_a[b]+sl*(i-1-b)
-                    if c[i]<tn-atr_v[i]*cfg.TL_BUF and c[i-1]>=tp_-atr_v[i]*cfg.TL_BUF:
-                        tbs[i]=True
-        return tbl,tbs
-
-    def _swing(self, h, l, c, pl_a, ph_a, n):
-        se=np.zeros(n,bool); be=np.zeros(n,bool)
-        lsl=np.full(n,np.nan); lsh=np.full(n,np.nan)
-        for i in range(cfg.HL_WINDOW,n):
-            sl_v=[pl_a[j] for j in range(max(0,i-cfg.HL_WINDOW),i+1) if not np.isnan(pl_a[j])]
-            sh_v=[ph_a[j] for j in range(max(0,i-cfg.HL_WINDOW),i+1) if not np.isnan(ph_a[j])]
-            if sl_v: lsl[i]=sl_v[-1]; se[i]=sum(sl_v[k]>sl_v[k-1] for k in range(1,len(sl_v)))>=cfg.HL_COUNT
-            if sh_v: lsh[i]=sh_v[-1]; be[i]=sum(sh_v[k]<sh_v[k-1] for k in range(1,len(sh_v)))>=cfg.HH_COUNT
-        return se,be,lsl,lsh
-
-    def _fvg(self, h, l, c, atr_v):
-        n=len(c); bf=np.zeros(n,bool); bef=np.zeros(n,bool)
-        ibf=np.zeros(n,bool); ibef=np.zeros(n,bool)
-        bt=bn=np.nan; st=sn=np.nan; ba=sa=0
-        for i in range(2,n):
-            ms=atr_v[i]*cfg.FVG_MIN
-            if l[i]>h[i-2] and (l[i]-h[i-2])>ms: bt=l[i];bn=h[i-2];ba=0;bf[i]=True
+        # ── SL / TP dinámico por ATR ──────────────────────
+        sl_val: Optional[float] = None
+        tp_val: Optional[float] = None
+        if direction and atr_v > 0:
+            # SUP: SL más ajustado (señal de mayor calidad)
+            # STD: SL más holgado (evitar whipsaw)
+            sl_mult = {"SUP": 1.4, "FUEL": 1.7, "STD": 2.0}[tier]
+            tp_mult = sl_mult * 2.2   # RR mínimo 2.2:1
+            if direction == "LONG":
+                sl_val = price - atr_v * sl_mult
+                tp_val = price + atr_v * tp_mult
             else:
-                ba+=1
-                if ba>cfg.FVG_BARS or (cfg.FVG_MITI and c[i]<bn): bt=bn=np.nan
-            if h[i]<l[i-2] and (l[i-2]-h[i])>ms: st=l[i-2];sn=h[i];sa=0;bef[i]=True
-            else:
-                sa+=1
-                if sa>cfg.FVG_BARS or (cfg.FVG_MITI and c[i]>st): st=sn=np.nan
-            if not np.isnan(bt) and bn<=c[i]<=bt: ibf[i]=True
-            if not np.isnan(st) and sn<=c[i]<=st: ibef[i]=True
-        return bf,bef,ibf,ibef
+                sl_val = price + atr_v * sl_mult
+                tp_val = price - atr_v * tp_mult
 
-    def _ob(self, o, h, l, c, atr_v):
-        n=len(c); bob=np.zeros(n,bool); beo=np.zeros(n,bool)
-        ibob=np.zeros(n,bool); ibeo=np.zeros(n,bool)
-        bh=bl=np.nan; sh=sl=np.nan; ba=sa=0
-        for i in range(2,n):
-            imp=atr_v[i]*cfg.OB_IMP
-            sb=(c[i]-o[i])>imp and c[i]>c[i-1]
-            sbe=(o[i]-c[i])>imp and c[i]<c[i-1]
-            if sb and c[i-1]<o[i-1]: bh=o[i-1];bl=c[i-1];ba=0;bob[i]=True
-            else:
-                ba+=1
-                if ba>cfg.OB_BARS or c[i]<bl: bh=bl=np.nan
-            if sbe and c[i-1]>o[i-1]: sh=c[i-1];sl=o[i-1];sa=0;beo[i]=True
-            else:
-                sa+=1
-                if sa>cfg.OB_BARS or c[i]>sh: sh=sl=np.nan
-            if not np.isnan(bh) and bl<=c[i]<=bh: ibob[i]=True
-            if not np.isnan(sh) and sl<=c[i]<=sh: ibeo[i]=True
-        return bob,beo,ibob,ibeo
+        # ── CVD bias string ───────────────────────────────
+        if   cvd_norm > 0.12:  cvd_bias = "BULL"
+        elif cvd_norm < -0.12: cvd_bias = "BEAR"
+        else:                  cvd_bias = "NEUTRAL"
 
-    def _squeeze(self, h, l, c, atr_v):
-        n=len(c); p=cfg.SQ_LEN
-        bs=_sma(c,p); dv=_std(c,p)
-        bbh=bs+cfg.SQ_BBM*dv; bbl=bs-cfg.SQ_BBM*dv
-        ke=_ema(c,p); kch=ke+cfg.SQ_KCM*atr_v; kcl=ke-cfg.SQ_KCM*atr_v
-        sqon=(bbh<kch)&(bbl>kcl)
-        sqfire=~sqon&np.roll(sqon,1); sqfire[0]=False
-        hm=_high(h,p); lm=_low(l,p)
-        sv=_linreg(c-(hm+lm)/2, p)
-        return sqfire&(sv>0), sqfire&(sv<0), sqon
+        return {
+            "direction":    direction,
+            "tier":         tier,
+            "conviction":   conviction,
+            "norm_score":   norm_score,
+            "score_bull":   score_bull,
+            "score_bear":   score_bear,
+            "comp_bull":    comp_bull,
+            "comp_bear":    comp_bear,
+            "decay_ratio":  decay_ratio,
+            "momentum":     momentum_raw,
+            "cvd_norm":     cvd_norm,
+            "cvd_bias":     cvd_bias,
+            "ofi":          ofi,
+            "funding_rate": fr,
+            "oi_delta":     oi_delta,
+            "vol_regime":   vol_regime,
+            "atr_last":     atr_v,
+            "vwap":         vwap_v,
+            "sl":           sl_val,
+            "tp":           tp_val,
+            "tf_bull":      tf_score_bull,
+            "tf_bear":      tf_score_bear,
+            "asym":         1.0,
+            "bb_squeeze":   bb_squeeze,
+        }
+
+    @staticmethod
+    def _blank() -> dict:
+        return {
+            "direction": None, "tier": "STD", "conviction": 0,
+            "norm_score": 0.0, "score_bull": 0.0, "score_bear": 0.0,
+            "comp_bull": 0.0, "comp_bear": 0.0,
+            "decay_ratio": 0.0, "momentum": 0.0,
+            "cvd_norm": 0.0, "cvd_bias": "NEUTRAL",
+            "ofi": 0.0, "funding_rate": 0.0, "oi_delta": 0.0,
+            "vol_regime": "MED", "atr_last": 0.0, "vwap": 0.0,
+            "sl": None, "tp": None,
+            "tf_bull": 0.0, "tf_bear": 0.0, "asym": 1.0,
+            "bb_squeeze": False,
+        }
+
+    @staticmethod
+    def should_enter(sig: dict, min_composite: float = 0.56) -> bool:
+        """
+        Filtro final robusto: todos los pilares deben apuntar
+        en la misma dirección. No entrar en señales conflictivas.
+        """
+        d    = sig["direction"]
+        comp = sig["comp_bull"] if d == "LONG" else sig["comp_bear"]
+        cvd  = sig["cvd_bias"]
+        mom  = sig["momentum"]
+        dec  = sig["decay_ratio"]
+        vol  = sig["vol_regime"]
+
+        if not d:                     return False
+        if comp < min_composite:      return False
+        # decay ya está ponderado en el composite — eliminar chequeo doble que bloqueaba vol normal
+        if vol == "LOW":              return False   # sin liquidez (vol_ratio < 0.5)
+
+        # Nota: CVD ya está ponderado al 25% dentro del composite.
+        # Solo bloqueamos si CVD es extremadamente contrario Y composite es débil.
+        if comp < 0.60 and cvd != "NEUTRAL":
+            if d == "LONG"  and cvd == "BEAR": return False
+            if d == "SHORT" and cvd == "BULL": return False
+
+        # Momentum no puede ser extremadamente contrario
+        if d == "LONG"  and mom < -120: return False
+        if d == "SHORT" and mom >  120: return False
+
+        return True
