@@ -2,7 +2,7 @@
 Telegram Client v5 — mensajes actualizados con L13/L14/L15 y trailing SL
 """
 import aiohttp, logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger("Telegram")
 API = "https://api.telegram.org/bot{token}/{method}"
@@ -73,7 +73,7 @@ class TelegramClient:
             f"━━━━━━━━━━━━━━━━━\n"
             f"💰 Entrada  : `{price:.4f}`\n"
             f"🛡 Stop-Loss: `{sl:.4f}`\n"
-            f"🎯 Take-Prof: `{tp:.4f if tp else '—'}`\n"
+            f"🎯 Take-Prof: `{f"{tp:.4f}" if tp else "—"}`\n"
             f"📐 R/R      : `{rr:.2f}×`\n"
             f"📦 Size     : `{size:.4f}`\n"
             f"━━━━━━━━━━━━━━━━━\n"
@@ -99,7 +99,7 @@ class TelegramClient:
             f"  SQ `{'✅' if sig.get('sq_bull' if d=='LONG' else 'sq_bear') else '—'}`"
             f"  DP `{'✅' if sig.get('dp_buy' if d=='LONG' else 'dp_sell') else '—'}`\n"
             f"━━━━━━━━━━━━━━━━━\n"
-            f"🆔 `{order_id}`  ⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+            f"🆔 `{order_id}`  ⏱ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
         await self.send_message(msg)
 
@@ -112,7 +112,7 @@ class TelegramClient:
             f"{e} *CIERRE {side}* — `{symbol}`\n"
             f"Entrada: `{entry:.4f}` → Salida: `{exit_p:.4f}`\n"
             f"PnL: `{s}{pnl_pct:.2f}%` | {reason}{tr}\n"
-            f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+            f"⏱ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
 
     async def send_status(self, balance, positions, global_stats=None):
@@ -139,11 +139,11 @@ class TelegramClient:
             f"━━━━━━━━━━━━━━━━━\n"
             f"*Posiciones:*\n{pos_lines}"
             f"{gs_block}"
-            f"⏱ {datetime.utcnow().strftime('%H:%M UTC')}"
+            f"⏱ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
         )
 
     async def send_error(self, error):
         await self.send_message(
             f"⚠️ *Error*\n```\n{str(error)[:300]}\n```\n"
-            f"⏱ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+            f"⏱ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
