@@ -1,11 +1,9 @@
 """
-QF×JP Bot v5.3 — Crash-resistant + señales 3min optimizadas
-Fixes:
-  • main() envuelto en try/except — nunca crashea en startup
-  • scanner_loop auto-reinicia si falla
-  • tasks individuales auto-reinician sin matar el bot
-  • Umbrales ajustados para generar señales reales en 3min
-  • Modo SIGNAL envía alertas aunque sea sin operar real
+QF×JP Bot v5.4 — Fixes sobre v5.3
+  • datetime.utcnow() → datetime.now(timezone.utc)  (DeprecationWarning eliminado)
+  • max_daily_loss_ok adaptado a RiskManager v5.7 (gestión start_balance interna)
+  • run_symbol ya no recibe start_bal (innecesario)
+  • risk.update_start_balance(bal) llamado al inicio y en scanner tras reset diario
 """
 import asyncio, logging, signal as signal_mod, sys, traceback, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,17 +29,16 @@ logging.basicConfig(
 log = logging.getLogger("MAIN")
 
 # ── Estado global ─────────────────────────────────────────────
-active_positions : dict       = {}
+active_positions : dict             = {}
 prev_oi          : dict[str, float] = {}
-_shutdown        : bool       = False
+_shutdown        : bool             = False
 
 
 # ─────────────────────────────────────────────────────────────
 #  LOOP POR SÍMBOLO
 # ─────────────────────────────────────────────────────────────
-async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_bal):
+async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
     log.info(f"[{symbol}] task arrancada")
-    daily_bal = [start_bal]
     consecutive_errors = 0
 
     while not _shutdown:
@@ -59,8 +56,10 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
             if bal <= 0:
                 await asyncio.sleep(30); continue
 
-            # ── DD diario ───────────────────────────────────
-            if not risk.max_daily_loss_ok(daily_bal[0], bal, cfg.MAX_DAILY_DD_PCT):
+            # ── DD diario — RiskManager v5.7 gestiona start_balance internamente
+            #    update_start_balance hace reset automático a medianoche UTC
+            risk.update_start_balance(bal)
+            if not risk.max_daily_loss_ok(bal, cfg.MAX_DAILY_DD_PCT):
                 await asyncio.sleep(3600); continue
 
             # ── Límite posiciones ───────────────────────────
@@ -126,11 +125,11 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
                                 pos["trail_sl"] = new_t
                             pos["sl"] = min(pos["sl"], pos["trail_sl"])
 
-                sl_hit = ((pos["side"]=="LONG"  and price <= pos["sl"]) or
-                          (pos["side"]=="SHORT" and price >= pos["sl"]))
+                sl_hit = ((pos["side"] == "LONG"  and price <= pos["sl"]) or
+                          (pos["side"] == "SHORT" and price >= pos["sl"]))
                 tp_hit = (pos.get("tp") and
-                          ((pos["side"]=="LONG"  and price >= pos["tp"]) or
-                           (pos["side"]=="SHORT" and price <= pos["tp"])))
+                          ((pos["side"] == "LONG"  and price >= pos["tp"]) or
+                           (pos["side"] == "SHORT" and price <= pos["tp"])))
                 rev    = (sig["direction"] and sig["direction"] != pos["side"]
                           and sig["conviction"] >= 7)
 
@@ -140,8 +139,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
                 if reason:
                     if cfg.MODE == "LIVE":
                         await exchange.close_position(symbol, pos["side"])
-                    pnl = ((price-pos["entry"])/pos["entry"]*100 if pos["side"]=="LONG"
-                           else (pos["entry"]-price)/pos["entry"]*100)
+                    pnl = ((price - pos["entry"]) / pos["entry"] * 100 if pos["side"] == "LONG"
+                           else (pos["entry"] - price) / pos["entry"] * 100)
                     await tg.send_close(symbol, pos["side"], pos["entry"], price, pnl, reason,
                                         trail_was_active=pos.get("trail_active", False))
                     perf.record(TradeRecord(symbol=symbol, side=pos["side"],
@@ -152,15 +151,22 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
 
             # ── Nueva entrada ────────────────────────────────
             if symbol not in active_positions and sig["direction"]:
-                tier  = sig["tier"]; conv = sig["conviction"]
-                min_c = (cfg.MIN_CONV_SUP  if tier=="SUP"  else
-                         cfg.MIN_CONV_FUEL if tier=="FUEL" else cfg.MIN_CONV_STD)
+                tier  = sig["tier"]
+                conv  = sig["conviction"]
+                min_c = (cfg.MIN_CONV_SUP  if tier == "SUP"  else
+                         cfg.MIN_CONV_FUEL if tier == "FUEL" else cfg.MIN_CONV_STD)
 
                 if sig.get("vol_regime") == "LOW" or conv < min_c:
                     await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
-                sl   = sig["sl"]; tp = sig.get("tp")
-                size = risk.position_size(bal, price, sl, cfg.RISK_PER_TRADE_PCT, cfg.LEVERAGE)
+                sl   = sig["sl"]
+                tp   = sig.get("tp")
+                atr  = sig.get("atr_last", None)
+                size = risk.position_size(
+                    bal, price, sl,
+                    cfg.RISK_PER_TRADE_PCT, cfg.LEVERAGE,
+                    atr=atr,
+                )
                 if size <= 0:
                     await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
@@ -178,14 +184,16 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
 
                 active_positions[symbol] = dict(
                     side=sig["direction"], entry=price, sl=sl, tp=tp,
-                    size=size, conv=conv, tier=tier, time=datetime.utcnow(),
-                    atr=sig.get("atr_last", 0), trail_active=False, trail_sl=None,
+                    size=size, conv=conv, tier=tier,
+                    time=datetime.now(timezone.utc),   # FIX: era datetime.utcnow()
+                    atr=sig.get("atr_last", 0),
+                    trail_active=False, trail_sl=None,
                 )
                 await tg.send_entry(symbol, sig, price, size, order_id, mctx)
                 log.info(f"[{symbol}] ✅ {sig['direction']} {tier} conv={conv}/10 "
                          f"score={sig['norm_score']:.2f} OFI={sig['ofi']:.2f}")
 
-            consecutive_errors = 0  # reset en éxito
+            consecutive_errors = 0
 
         except asyncio.CancelledError:
             log.info(f"[{symbol}] task cancelada")
@@ -204,7 +212,7 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, start_ba
 
 
 # ─────────────────────────────────────────────────────────────
-#  SCANNER LOOP — auto-reinicia siempre
+#  SCANNER LOOP
 # ─────────────────────────────────────────────────────────────
 async def scanner_loop(exchange, tg, perf, engine, risk, session):
     scanner = MarketScanner(exchange)
@@ -224,12 +232,10 @@ async def scanner_loop(exchange, tg, perf, engine, risk, session):
                     f"⛔ Suspendidos: {', '.join(gs['suspended']) or 'ninguno'}"
                 )
 
-            bal = await exchange.get_balance()
-
             for sym in symbols:
                 if sym not in tasks or tasks[sym].done():
                     tasks[sym] = asyncio.create_task(
-                        run_symbol(sym, exchange, tg, risk, session, engine, perf, bal)
+                        run_symbol(sym, exchange, tg, risk, session, engine, perf)
                     )
 
             # Cancelar pares eliminados
@@ -261,13 +267,13 @@ async def status_loop(tg, exchange, perf):
 
 
 # ─────────────────────────────────────────────────────────────
-#  MAIN — completamente defensivo
+#  MAIN
 # ─────────────────────────────────────────────────────────────
 async def main():
     global _shutdown
 
     log.info("═══════════════════════════════════════")
-    log.info("  QF×JP Bot v5.3  |  BingX Futures")
+    log.info("  QF×JP Bot v5.4  |  BingX Futures")
     log.info(f"  SCORE_THR={cfg.SCORE_THR_LONG} | DECAY_THR={cfg.DECAY_THR}")
     log.info(f"  MAKER_ORDERS={'ON' if cfg.USE_MAKER_ORDERS else 'OFF'}")
     log.info(f"  MODE={cfg.MODE} | MAX_POS={cfg.MAX_OPEN_POSITIONS}")
@@ -281,7 +287,7 @@ async def main():
     engine   = QFJPEngine()
     perf     = PerformanceTracker(cfg.PF_WINDOW, cfg.MIN_PROFIT_FACTOR)
 
-    # ── Balance inicial (con fallback) ───────────────────────
+    # ── Balance inicial ──────────────────────────────────────
     bal = 0.0
     for attempt in range(5):
         try:
@@ -295,11 +301,14 @@ async def main():
 
     log.info(f"Balance inicial: {bal:.2f} USDT")
 
+    # ── Registrar start_balance del día en RiskManager v5.7 ─
+    risk.update_start_balance(bal)
+
     # ── Mensaje de inicio ────────────────────────────────────
     try:
         maker_fee = "0.04% (maker)" if cfg.USE_MAKER_ORDERS else "0.15% (market)"
         await tg.send_message(
-            f"🟢 *QF×JP Bot v5.3 iniciado*\n"
+            f"🟢 *QF×JP Bot v5.4 iniciado*\n"
             f"{'🔴 LIVE' if cfg.MODE=='LIVE' else '🟡 SIGNAL ONLY'} | "
             f"Balance: `{bal:.2f} USDT`\n"
             f"Fees: `{maker_fee}` | Trailing SL: `✅`\n"
@@ -311,7 +320,7 @@ async def main():
     except Exception as e:
         log.warning(f"Telegram startup: {e}")
 
-    # ── Signal handlers ─────────────────────────────────────
+    # ── Signal handlers ──────────────────────────────────────
     loop = asyncio.get_event_loop()
     def _stop():
         global _shutdown
@@ -321,7 +330,7 @@ async def main():
     for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
         loop.add_signal_handler(sig, _stop)
 
-    # ── Lanzar loops ────────────────────────────────────────
+    # ── Lanzar loops ─────────────────────────────────────────
     try:
         await asyncio.gather(
             scanner_loop(exchange, tg, perf, engine, risk, session),
