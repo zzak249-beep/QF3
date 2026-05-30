@@ -7,7 +7,8 @@ Fixes:
   • Umbrales ajustados para generar señales reales en 3min
   • Modo SIGNAL envía alertas aunque sea sin operar real
 """
-import asyncio, logging, signal as signal_mod, sys, traceback
+import asyncio, logging, signal as signal_mod, sys, traceback, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timezone
 
 from config import cfg
