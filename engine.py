@@ -414,8 +414,18 @@ class QFJPEngine:
         )
 
     def _df(self, raw):
-        df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
-        for col in ["open","high","low","close","volume"]:
+        if not raw:
+            return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+        rows = []
+        for k in raw:
+            if isinstance(k, (list, tuple)) and len(k) >= 6:
+                rows.append([k[0],k[1],k[2],k[3],k[4],k[5]])
+            elif isinstance(k, dict):
+                ts = k.get("timestamp") or k.get("time") or k.get("t") or 0
+                rows.append([ts, k.get("open",0), k.get("high",0),
+                              k.get("low",0), k.get("close",0), k.get("volume",0)])
+        df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+        for col in ["timestamp","open","high","low","close","volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df.dropna().reset_index(drop=True)
 
