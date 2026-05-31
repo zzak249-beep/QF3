@@ -1,12 +1,12 @@
 """
-QF×JP Bot v5.5 — Graceful shutdown + aiohttp session cleanup
-Fixes sobre v5.4:
-  • _stop() ya no cancela tasks directamente — usa evento asyncio.Event
-  • shutdown() espera que las tasks terminen antes de cerrar sesiones
-  • exchange.close() y tg.close() llamados en finally (evita Unclosed session)
-  • Cancellation propagada limpiamente con gather(return_exceptions=True)
+QF×JP Bot v5.6 — Fix: balance insuficiente + DD check order
+Fixes sobre v5.5:
+  • MIN_OPERABLE_BALANCE: si balance < 5 USDT → alerta Telegram + pausa 1h
+  • DD check se ejecuta ANTES de update_start_balance (no pisa start con balance roto)
+  • _warn_global helper para evitar spam de alertas de balance
+  • update_start_balance solo se llama cuando el DD check pasa (balance sano)
 """
-import asyncio, logging, signal as signal_mod, sys, traceback, os
+import asyncio, logging, signal as signal_mod, sys, traceback, os, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timezone
 
@@ -32,22 +32,27 @@ log = logging.getLogger("MAIN")
 # ── Estado global ─────────────────────────────────────────────
 active_positions : dict             = {}
 prev_oi          : dict[str, float] = {}
-_stop_event      : asyncio.Event    = None   # señal de parada limpia
+_stop_event      : asyncio.Event    = None
+
+# ── Cooldown global para warnings de balance (evita spam) ────
+_global_warn_ts  : dict[str, float] = {}
+MIN_OPERABLE_BALANCE = 5.0  # USDT — ajusta si tu exchange requiere más
+
+def _can_warn_global(key: str, cooldown: float = 3600.0) -> bool:
+    """Devuelve True solo si pasaron >= cooldown segundos desde el último warn de este tipo."""
+    now = time.monotonic()
+    if now - _global_warn_ts.get(key, 0.0) >= cooldown:
+        _global_warn_ts[key] = now
+        return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────
 #  SHUTDOWN LIMPIO
 # ─────────────────────────────────────────────────────────────
 async def _graceful_shutdown(running_tasks: list, clients: list):
-    """
-    1. Señaliza parada a todos los loops (via _stop_event)
-    2. Cancela tasks y espera a que terminen
-    3. Cierra sesiones aiohttp en orden
-    """
     log.info("⏹ Iniciando shutdown limpio...")
     _stop_event.set()
-
-    # Dar 5 s para que los loops terminen solos antes de cancelar
     await asyncio.sleep(5)
 
     for task in running_tasks:
@@ -57,7 +62,6 @@ async def _graceful_shutdown(running_tasks: list, clients: list):
     await asyncio.gather(*running_tasks, return_exceptions=True)
     log.info("Tasks canceladas")
 
-    # Cerrar sesiones HTTP (evita ResourceWarning de aiohttp)
     for client in clients:
         for method_name in ("close", "aclose"):
             fn = getattr(client, method_name, None)
@@ -71,7 +75,6 @@ async def _graceful_shutdown(running_tasks: list, clients: list):
                     log.warning(f"Error cerrando {client.__class__.__name__}: {e}")
                 break
 
-    # Esperar un ciclo extra para que aiohttp libere conectores
     await asyncio.sleep(0.5)
     log.info("Shutdown completado")
 
@@ -86,21 +89,49 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
     while not _stop_event.is_set():
         try:
             if not session.is_tradeable():
-                await asyncio.sleep(30); continue
+                await asyncio.sleep(30)
+                continue
 
             if not perf.is_tradeable(symbol):
-                await asyncio.sleep(60); continue
+                await asyncio.sleep(60)
+                continue
 
             bal = await exchange.get_balance()
-            if bal <= 0:
-                await asyncio.sleep(30); continue
 
-            risk.update_start_balance(bal)
+            # ── 1. Balance mínimo operable ───────────────────────────────
+            # CRÍTICO: verificar ANTES del DD check para no entrar en loop infinito
+            if bal < MIN_OPERABLE_BALANCE:
+                if _can_warn_global(f"low_balance_{symbol}", cooldown=3600.0):
+                    log.warning(
+                        f"[{symbol}] Balance {bal:.4f} USDT < mínimo {MIN_OPERABLE_BALANCE} USDT"
+                    )
+                    try:
+                        await tg.send_message(
+                            f"⚠️ *Balance insuficiente*\n"
+                            f"Balance actual: `{bal:.4f} USDT`\n"
+                            f"Mínimo requerido: `{MIN_OPERABLE_BALANCE} USDT`\n"
+                            f"El bot está pausado. Deposita fondos para reanudar."
+                        )
+                    except Exception:
+                        pass
+                await asyncio.sleep(3600)
+                continue
+
+            # ── 2. DD check ANTES de update_start_balance ───────────────
+            # ORDEN IMPORTANTE: si hacemos update_start_balance primero con un balance
+            # dañado (ej. 0.02 USDT), el start_balance se pisa y el DD nunca se detecta.
             if not risk.max_daily_loss_ok(bal, cfg.MAX_DAILY_DD_PCT):
-                await asyncio.sleep(3600); continue
+                # El RiskManager ya loguea el warning con cooldown interno
+                await asyncio.sleep(3600)
+                continue
 
-            if symbol not in active_positions and len(active_positions) >= cfg.MAX_OPEN_POSITIONS:
-                await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+            # ── 3. Actualizar start_balance solo con balance sano ────────
+            # RiskManager ya gestiona el reset diario automático internamente
+            risk.update_start_balance(bal)
+
+            if len(active_positions) >= cfg.MAX_OPEN_POSITIONS and symbol not in active_positions:
+                await asyncio.sleep(cfg.LOOP_INTERVAL)
+                continue
 
             results = await asyncio.gather(
                 exchange.get_klines(symbol, "3m",  250),
@@ -112,7 +143,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
             ohlcv_3m, ohlcv_15m, ohlcv_1h, ohlcv_1m = results
 
             if isinstance(ohlcv_3m, Exception) or len(ohlcv_3m) < 50:
-                await asyncio.sleep(15); continue
+                await asyncio.sleep(15)
+                continue
 
             ohlcv_15m = [] if isinstance(ohlcv_15m, Exception) else ohlcv_15m
             ohlcv_1h  = [] if isinstance(ohlcv_1h,  Exception) else ohlcv_1h
@@ -186,7 +218,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
                          cfg.MIN_CONV_FUEL if tier == "FUEL" else cfg.MIN_CONV_STD)
 
                 if sig.get("vol_regime") == "LOW" or conv < min_c:
-                    await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+                    await asyncio.sleep(cfg.LOOP_INTERVAL)
+                    continue
 
                 sl   = sig["sl"]
                 tp   = sig.get("tp")
@@ -197,7 +230,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
                     atr=atr,
                 )
                 if size <= 0:
-                    await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+                    await asyncio.sleep(cfg.LOOP_INTERVAL)
+                    continue
 
                 order_id = "SIGNAL_ONLY"
                 if cfg.MODE == "LIVE":
@@ -208,7 +242,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
                         maker_offset_pct=cfg.MAKER_OFFSET_PCT,
                     )
                     if not order:
-                        await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+                        await asyncio.sleep(cfg.LOOP_INTERVAL)
+                        continue
                     order_id = order.get("orderId", "?")
 
                 active_positions[symbol] = dict(
@@ -273,7 +308,6 @@ async def scanner_loop(exchange, tg, perf, engine, risk, session):
                     del tasks[sym]
 
         except asyncio.CancelledError:
-            # Shutdown: cancelar todas las tasks de símbolos
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -308,10 +342,11 @@ async def main():
     _stop_event = asyncio.Event()
 
     log.info("═══════════════════════════════════════")
-    log.info("  QF×JP Bot v5.5  |  BingX Futures")
+    log.info("  QF×JP Bot v5.6  |  BingX Futures")
     log.info(f"  SCORE_THR={cfg.SCORE_THR_LONG} | DECAY_THR={cfg.DECAY_THR}")
     log.info(f"  MAKER_ORDERS={'ON' if cfg.USE_MAKER_ORDERS else 'OFF'}")
     log.info(f"  MODE={cfg.MODE} | MAX_POS={cfg.MAX_OPEN_POSITIONS}")
+    log.info(f"  MIN_BALANCE={MIN_OPERABLE_BALANCE} USDT | MAX_DD={cfg.MAX_DAILY_DD_PCT}%")
     log.info("═══════════════════════════════════════")
 
     tg       = TelegramClient(cfg.TG_TOKEN, cfg.TG_CHAT_ID)
@@ -333,9 +368,17 @@ async def main():
             await asyncio.sleep(10)
 
     log.info(f"Balance inicial: {bal:.2f} USDT")
-    risk.update_start_balance(bal)
 
-    # ── Signal handlers — usan Event en lugar de cancelar tasks ─
+    # Solo inicializar start_balance si el balance es operable
+    # Si no, el reset diario lo tomará cuando el usuario deposite
+    if bal >= MIN_OPERABLE_BALANCE:
+        risk.update_start_balance(bal)
+    else:
+        log.warning(
+            f"Balance inicial {bal:.2f} USDT < mínimo {MIN_OPERABLE_BALANCE} USDT — "
+            f"start_balance NO inicializado hasta que haya fondos suficientes"
+        )
+
     loop = asyncio.get_event_loop()
     def _stop():
         log.info("Señal de parada recibida")
@@ -345,12 +388,18 @@ async def main():
 
     try:
         maker_fee = "0.04% (maker)" if cfg.USE_MAKER_ORDERS else "0.15% (market)"
+        balance_msg = (
+            f"Balance: `{bal:.2f} USDT`" if bal >= MIN_OPERABLE_BALANCE
+            else f"⚠️ Balance insuficiente: `{bal:.4f} USDT` — deposita fondos"
+        )
         await tg.send_message(
-            f"🟢 *QF×JP Bot v5.5 iniciado*\n"
+            f"🟢 *QF×JP Bot v5.6 iniciado*\n"
             f"{'🔴 LIVE' if cfg.MODE=='LIVE' else '🟡 SIGNAL ONLY'} | "
-            f"Balance: `{bal:.2f} USDT`\n"
+            f"{balance_msg}\n"
             f"Fees: `{maker_fee}` | Trailing SL: `✅`\n"
             f"OFI + FR + OI: `✅` | Multi-TF: `✅`\n"
+            f"Min balance: `{MIN_OPERABLE_BALANCE} USDT` | "
+            f"Max DD: `{cfg.MAX_DAILY_DD_PCT}%`\n"
             f"Score: `{cfg.SCORE_THR_LONG*100:.0f}%` | "
             f"Decay: `{cfg.DECAY_THR*100:.0f}%` | "
             f"Leverage: `{cfg.LEVERAGE}×`"
@@ -358,7 +407,6 @@ async def main():
     except Exception as e:
         log.warning(f"Telegram startup: {e}")
 
-    # ── Lanzar loops ─────────────────────────────────────────
     t_scanner = asyncio.create_task(
         scanner_loop(exchange, tg, perf, engine, risk, session)
     )
@@ -371,7 +419,6 @@ async def main():
     except Exception as e:
         log.error(f"gather error: {e}\n{traceback.format_exc()}")
     finally:
-        # ── Shutdown limpio: esperar tasks y cerrar sesiones HTTP ──
         await _graceful_shutdown(
             running_tasks=[t_scanner, t_status],
             clients=[exchange, tg],
