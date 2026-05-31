@@ -1,5 +1,5 @@
 """
-Telegram Client v5 — mensajes actualizados con L13/L14/L15 y trailing SL
+Telegram Client v5.1 — añadido close() para shutdown limpio sin ResourceWarning
 """
 import aiohttp, logging
 from datetime import datetime, timezone
@@ -19,6 +19,13 @@ class TelegramClient:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10))
         return self._session
+
+    async def close(self):
+        """Cierra la sesión aiohttp. Llamar antes de terminar el proceso."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+            log.info("Session cerrada")
 
     async def send_message(self, text, parse_mode="Markdown"):
         url  = API.format(token=self.token, method="sendMessage")
@@ -44,27 +51,24 @@ class TelegramClient:
         rr   = abs((tp-price)/(price-sl)) if tp and sl and (price-sl)!=0 else 0
         vol_e= {"LOW":"⚪","NORMAL":"🟢","HIGH":"🔴"}.get(sig.get("vol_regime",""),"")
 
-        # ── OFI display ─────────────────────────────────────
         ofi  = sig.get("ofi", 0.0)
-        if ofi > 0.5:   ofi_e = "🟢🟢"
-        elif ofi > 0.3: ofi_e = "🟢"
+        if ofi > 0.5:    ofi_e = "🟢🟢"
+        elif ofi > 0.3:  ofi_e = "🟢"
         elif ofi < -0.5: ofi_e = "🔴🔴"
         elif ofi < -0.3: ofi_e = "🔴"
         else:            ofi_e = "⚪"
 
-        # ── Funding Rate display ─────────────────────────────
         fr  = sig.get("funding_rate", 0.0)
         frp = f"{fr*100:.4f}%"
         if sig.get("fr_extreme"): fr_e = "⚠️ EXTREMO"
-        elif sig.get("fr_bull"): fr_e = "🟢"
-        elif sig.get("fr_bear"): fr_e = "🔴"
-        else:                    fr_e = "⚪"
+        elif sig.get("fr_bull"):  fr_e = "🟢"
+        elif sig.get("fr_bear"):  fr_e = "🔴"
+        else:                     fr_e = "⚪"
 
-        # ── OI delta display ─────────────────────────────────
         oid = sig.get("oi_delta", 0.0)
-        if sig.get("oi_rising"):   oi_e = f"📈 +{oid:.2%}"
-        elif sig.get("oi_falling"):oi_e = f"📉 {oid:.2%}"
-        else:                      oi_e = f"➡️ {oid:.2%}"
+        if sig.get("oi_rising"):    oi_e = f"📈 +{oid:.2%}"
+        elif sig.get("oi_falling"): oi_e = f"📉 {oid:.2%}"
+        else:                       oi_e = f"➡️ {oid:.2%}"
 
         multi_e = "✅" if sig.get("multi_tf_aligned") else "—"
 
@@ -73,7 +77,7 @@ class TelegramClient:
             f"━━━━━━━━━━━━━━━━━\n"
             f"💰 Entrada  : `{price:.4f}`\n"
             f"🛡 Stop-Loss: `{sl:.4f}`\n"
-            f"🎯 Take-Prof: `{f"{tp:.4f}" if tp else "—"}`\n"
+            f"🎯 Take-Prof: `{f'{tp:.4f}' if tp else '—'}`\n"
             f"📐 R/R      : `{rr:.2f}×`\n"
             f"📦 Size     : `{size:.4f}`\n"
             f"━━━━━━━━━━━━━━━━━\n"
@@ -121,7 +125,8 @@ class TelegramClient:
             trail_str = " 🎯" if p.get("trail_active") else ""
             pos_lines += (f"  • `{sym}` {p['side']} entry=`{p['entry']:.4f}` "
                           f"sl=`{p['sl']:.4f}` conv=`{p['conv']}/10`{trail_str}\n")
-        if not pos_lines: pos_lines = "  _Sin posiciones_\n"
+        if not pos_lines:
+            pos_lines = "  _Sin posiciones_\n"
 
         gs_block = ""
         if global_stats and global_stats.get("total_trades", 0) > 0:
