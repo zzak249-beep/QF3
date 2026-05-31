@@ -1,5 +1,5 @@
 """
-Cliente BingX v5.5 — parser ultra-defensivo con logging de formato real
+Cliente BingX v5.6 — añadido close() para shutdown limpio sin ResourceWarning
 """
 import asyncio, hashlib, hmac, time, logging
 from urllib.parse import urlencode
@@ -8,18 +8,18 @@ import aiohttp
 log = logging.getLogger("BingX")
 BASE = "https://open-api.bingx.com"
 
-_KLINE_FORMAT_LOGGED = set()   # loguea el formato una sola vez por símbolo
+_KLINE_FORMAT_LOGGED = set()
 
 
 class BingXClient:
     def __init__(self, api_key, secret):
-        self.api_key       = api_key
-        self.secret        = secret
-        self._session      = None
-        self._bal_cache    = 0.0
-        self._bal_ts       = 0.0
-        self._BAL_TTL      = 120          # 2 min entre llamadas reales
-        self._bal_lock     = asyncio.Lock()  # evita 40 llamadas simultáneas
+        self.api_key    = api_key
+        self.secret     = secret
+        self._session   = None
+        self._bal_cache = 0.0
+        self._bal_ts    = 0.0
+        self._BAL_TTL   = 120
+        self._bal_lock  = asyncio.Lock()
 
     async def _sess(self):
         if self._session is None or self._session.closed:
@@ -27,6 +27,13 @@ class BingXClient:
                 headers={"X-BX-APIKEY": self.api_key},
                 timeout=aiohttp.ClientTimeout(total=15))
         return self._session
+
+    async def close(self):
+        """Cierra la sesión aiohttp. Llamar antes de terminar el proceso."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+            log.info("Session cerrada")
 
     def _sign(self, params):
         q = urlencode(sorted(params.items()))
@@ -55,7 +62,7 @@ class BingXClient:
             raise RuntimeError(f"POST {path}: {data}")
         return data.get("data", data)
 
-    # ── Klines — parser universal ────────────────────────────
+    # ── Klines ───────────────────────────────────────────────
     async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> list:
         try:
             raw = await self._get("/openApi/swap/v2/quote/klines",
@@ -64,7 +71,6 @@ class BingXClient:
             log.debug(f"get_klines {symbol}: {e}")
             return []
 
-        # Loguear formato real la primera vez
         if symbol not in _KLINE_FORMAT_LOGGED:
             _KLINE_FORMAT_LOGGED.add(symbol)
             if isinstance(raw, list) and len(raw) > 0:
@@ -76,32 +82,22 @@ class BingXClient:
         return self._parse_klines(raw, symbol)
 
     def _parse_klines(self, raw, symbol="") -> list:
-        """Parsea cualquier formato posible de BingX klines."""
         result = []
-
-        # Caso 1: raw es None o vacío
         if not raw:
             return []
-
-        # Caso 2: raw es una lista
         if isinstance(raw, list):
             for k in raw:
                 row = self._parse_one_kline(k)
                 if row:
                     result.append(row)
             return sorted(result, key=lambda x: x[0]) if result else []
-
-        # Caso 3: raw es un dict con arrays paralelos (formato OHLCV columnar)
-        # {"t": [ts,...], "o": [open,...], "h": [high,...], ...}
         if isinstance(raw, dict):
-            # Detectar claves de timestamp
             t_key = next((k for k in ["t","time","T","timestamp","ts"] if k in raw), None)
             o_key = next((k for k in ["o","open","O"] if k in raw), None)
             h_key = next((k for k in ["h","high","H"] if k in raw), None)
             l_key = next((k for k in ["l","low","L"] if k in raw), None)
             c_key = next((k for k in ["c","close","C"] if k in raw), None)
             v_key = next((k for k in ["v","volume","V","vol"] if k in raw), None)
-
             if t_key and o_key:
                 ts_arr = raw[t_key]; o_arr = raw[o_key]
                 h_arr  = raw.get(h_key, o_arr); l_arr = raw.get(l_key, o_arr)
@@ -114,20 +110,15 @@ class BingXClient:
                     except Exception:
                         continue
                 return sorted(result, key=lambda x: x[0])
-
-            # Dict con una sola clave que contiene la lista
             for v in raw.values():
                 if isinstance(v, list) and len(v) > 0:
                     return self._parse_klines(v, symbol)
-
         log.warning(f"[{symbol}] get_klines: formato desconocido {type(raw)} {str(raw)[:100]}")
         return []
 
     def _parse_one_kline(self, k) -> list:
-        """Parsea una vela individual (lista o dict)."""
         try:
             if isinstance(k, (list, tuple)):
-                # [ts, open, high, low, close, volume, ...]
                 if len(k) >= 6:
                     return [int(float(k[0])), float(k[1]), float(k[2]),
                             float(k[3]),      float(k[4]), float(k[5])]
@@ -140,25 +131,18 @@ class BingXClient:
                 h  = k.get("high")  or k.get("h") or k.get("H", o)
                 l  = k.get("low")   or k.get("l") or k.get("L", o)
                 c  = k.get("close") or k.get("c") or k.get("C", o)
-                v  = k.get("volume")or k.get("v") or k.get("V", 1)
+                v  = k.get("volume") or k.get("v") or k.get("V", 1)
                 return [int(float(ts)), float(o), float(h), float(l), float(c), float(v)]
-            elif isinstance(k, str):
-                # BingX a veces devuelve strings — ignorar
-                pass
         except Exception as e:
             log.debug(f"_parse_one_kline skip: {e} — k={str(k)[:60]}")
         return None
 
-    # ── Balance con lock + caché 2min ────────────────────────
+    # ── Balance ──────────────────────────────────────────────
     async def get_balance(self, force: bool = False) -> float:
         now = time.time()
-        # Sin lock: si está en caché devolver inmediatamente
         if not force and (now - self._bal_ts) < self._BAL_TTL:
             return self._bal_cache
-
-        # Con lock: solo una llamada real a la vez
         async with self._bal_lock:
-            # Comprobar de nuevo dentro del lock
             now = time.time()
             if not force and (now - self._bal_ts) < self._BAL_TTL:
                 return self._bal_cache
@@ -209,7 +193,7 @@ class BingXClient:
             "volume": float(t.get("volume",    0)),
         }
 
-    # ── L13/14/15 ────────────────────────────────────────────
+    # ── Market context ───────────────────────────────────────
     async def get_ofi(self, symbol: str, levels: int = 5) -> float:
         try:
             data  = await self._get("/openApi/swap/v2/quote/depth",
