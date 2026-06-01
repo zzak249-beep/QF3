@@ -1,13 +1,14 @@
 """
-QF×JP Bot v5.7 — Fix rate limiting en get_balance
-Fixes sobre v5.6:
-  • Balance centralizado: un solo BalanceCache compartido por todas las tasks
-  • get_balance() se llama UNA vez cada BALANCE_TTL segundos (no 29 veces en paralelo)
-  • Cooldown de low_balance warnings movido a 1h global (no por símbolo)
-  • Si BingX devuelve error de rate limit → usa último balance cacheado
-  • MIN_OPERABLE_BALANCE configurable via env var
+QF×JP Bot v5.6 — 4 mejoras de ventaja estadística en 3min
+Sobre v5.5:
+  [OFI-ML]  OFI multinivel: cfg.OFI_LEVELS subido a 10 (antes 5)
+  [H-FILT]  Filtro horario: altcoins evitan 18-23 UTC (baja liquidez)
+  [ALT-PRI] Prioridad altcoins: pares majors requieren +2 conv y umbral
+            de score más alto (alpha decayendo en BTC/ETH según research)
+  [CAT-LOG] Log de catalizadores: cada señal imprime qué condiciones
+            la dispararon (TL / SQ / FVG / OB / DP / CVD / SWP / CHoCH)
 """
-import asyncio, logging, signal as signal_mod, sys, traceback, os, time
+import asyncio, logging, signal as signal_mod, sys, traceback, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from datetime import datetime, timezone
 
@@ -30,65 +31,68 @@ logging.basicConfig(
 )
 log = logging.getLogger("MAIN")
 
-# ── Constantes ────────────────────────────────────────────────
-MIN_OPERABLE_BALANCE = float(os.getenv("MIN_BALANCE", "5.0"))  # USDT
-BALANCE_TTL          = int(os.getenv("BALANCE_TTL", "60"))     # segundos entre llamadas reales
-
 # ── Estado global ─────────────────────────────────────────────
 active_positions : dict             = {}
 prev_oi          : dict[str, float] = {}
 _stop_event      : asyncio.Event    = None
 
+# ── [ALT-PRI] Pares con alpha decayendo más rápido ───────────
+# Research 2026: VPIN en BTC pasó de +82bps/trade (2024) a +12bps (2026)
+# Altcoins pequeñas retienen mayor edge porque hay menos competencia algo
+MAJOR_PAIRS = {
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+}
+MAJOR_CONV_PENALTY  = 2    # +2 conv mínimo requerido en majors
+MAJOR_SCORE_PENALTY = 5    # +5 en umbral de score para majors
 
-# ─────────────────────────────────────────────────────────────
-#  BALANCE CACHE CENTRALIZADO
-#  Todas las tasks leen de aquí — solo una llamada real cada BALANCE_TTL s
-# ─────────────────────────────────────────────────────────────
-class BalanceCache:
-    def __init__(self, exchange, ttl: int = 60):
-        self._exchange  = exchange
-        self._ttl       = ttl
-        self._value     = 0.0
-        self._ts        = 0.0
-        self._lock      = asyncio.Lock()
-
-    async def get(self, force: bool = False) -> float:
-        now = time.monotonic()
-        if not force and (now - self._ts) < self._ttl:
-            return self._value                          # cache hit — sin llamada API
-
-        async with self._lock:
-            # Double-check tras adquirir el lock (otro task puede haber actualizado ya)
-            now = time.monotonic()
-            if not force and (now - self._ts) < self._ttl:
-                return self._value
-
-            try:
-                val = await self._exchange.get_balance(force=True)
-                if val >= 0:
-                    self._value = val
-                    self._ts    = time.monotonic()
-                    log.info(f"BalanceCache actualizado: {val:.4f} USDT")
-            except Exception as e:
-                log.warning(f"BalanceCache error (usando último valor {self._value:.4f}): {e}")
-
-        return self._value
-
-
-# ── Cooldown global para warnings ────────────────────────────
-_global_warn_ts: dict[str, float] = {}
-
-def _can_warn_global(key: str, cooldown: float = 3600.0) -> bool:
-    now = time.monotonic()
-    if now - _global_warn_ts.get(key, 0.0) >= cooldown:
-        _global_warn_ts[key] = now
-        return True
-    return False
+# ── [H-FILT] Ventana de baja liquidez UTC (altcoins) ─────────
+# Amberdata 2025: liquidez cae 42% entre 11 UTC y 21 UTC.
+# 18-23 UTC = transición NY-cierre / antes de Asia → más ruido, menos depth
+LOW_LIQ_HOUR_START = 18
+LOW_LIQ_HOUR_END   = 23
 
 
 # ─────────────────────────────────────────────────────────────
-#  SHUTDOWN LIMPIO
+#  HELPERS
 # ─────────────────────────────────────────────────────────────
+def _is_major(symbol: str) -> bool:
+    return symbol in MAJOR_PAIRS
+
+
+def _log_catalysts(symbol: str, sig: dict) -> str:
+    """[CAT-LOG] Construye string de catalizadores activos para logging."""
+    d   = sig.get("direction", "")
+    lng = d == "LONG"
+    cats = []
+
+    if sig.get("tl_break_long"  if lng else "tl_break_short"):  cats.append("TL")
+    if sig.get("sq_bull"        if lng else "sq_bear"):          cats.append("SQ")
+    if sig.get("in_bull_fvg"    if lng else "in_bear_fvg"):      cats.append("FVG")
+    if sig.get("in_bull_ob"     if lng else "in_bear_ob"):       cats.append("OB")
+    if sig.get("dp_buy"         if lng else "dp_sell"):          cats.append("DP")
+    if lng  and sig.get("cvd_rising"):                           cats.append("CVD↑")
+    if not lng and not sig.get("cvd_rising", True):              cats.append("CVD↓")
+    if sig.get("liq_bull_sweep" if lng else "liq_bear_sweep"):   cats.append("SWP")
+    if sig.get("choch_bull"     if lng else "choch_bear"):       cats.append("CHoCH")
+    if sig.get("bos_bull"       if lng else "bos_bear"):         cats.append("BoS")
+    if sig.get("cvd_bull_div"   if lng else "cvd_bear_div"):     cats.append("CVD-div")
+    if sig.get("rsi_bull_div_hid" if lng else "rsi_bear_div_hid"): cats.append("RSI-hid")
+
+    cat_str = " + ".join(cats) if cats else "base-score"
+    log.info(f"[{symbol}] catalizadores: {cat_str} | "
+             f"tier={sig.get('tier')} conv={sig.get('conviction')}/10 "
+             f"score={sig.get('norm_score', 0):.2f} major={'SÍ' if _is_major(symbol) else 'NO'}")
+    return cat_str
+
+
+def _graceful_shutdown_sync():
+    """Señaliza parada limpia."""
+    log.info("Señal de parada recibida")
+    if _stop_event:
+        _stop_event.set()
+
+
 async def _graceful_shutdown(running_tasks: list, clients: list):
     log.info("⏹ Iniciando shutdown limpio...")
     _stop_event.set()
@@ -121,51 +125,44 @@ async def _graceful_shutdown(running_tasks: list, clients: list):
 # ─────────────────────────────────────────────────────────────
 #  LOOP POR SÍMBOLO
 # ─────────────────────────────────────────────────────────────
-async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cache: BalanceCache):
-    log.info(f"[{symbol}] task arrancada")
+async def run_symbol(symbol, exchange, tg, risk, session, engine, perf):
+    log.info(f"[{symbol}] task arrancada {'(MAJOR)' if _is_major(symbol) else '(ALTCOIN)'}")
     consecutive_errors = 0
+    is_major = _is_major(symbol)
 
     while not _stop_event.is_set():
         try:
+            # ── Sesión ──────────────────────────────────────
             if not session.is_tradeable():
-                await asyncio.sleep(30)
+                await asyncio.sleep(30); continue
+
+            # ── [H-FILT] Filtro horario para altcoins ───────
+            # 18-23 UTC: liquidez cae 42% en altcoins → más ruido, menos edge
+            utc_hour = datetime.now(timezone.utc).hour
+            low_liq  = LOW_LIQ_HOUR_START <= utc_hour < LOW_LIQ_HOUR_END
+            if low_liq and not is_major:
+                await asyncio.sleep(cfg.LOOP_INTERVAL * 4)
                 continue
 
+            # ── PF mínimo ───────────────────────────────────
             if not perf.is_tradeable(symbol):
-                await asyncio.sleep(60)
-                continue
+                await asyncio.sleep(60); continue
 
-            # ── Balance desde caché (una sola llamada real cada BALANCE_TTL s) ──
-            bal = await bal_cache.get()
+            # ── Balance ─────────────────────────────────────
+            bal = await exchange.get_balance()
+            if bal <= 0:
+                await asyncio.sleep(30); continue
 
-            # ── 1. Balance mínimo operable ───────────────────────────────
-            if bal < MIN_OPERABLE_BALANCE:
-                if _can_warn_global("low_balance", cooldown=3600.0):
-                    log.warning(f"Balance {bal:.4f} USDT < mínimo {MIN_OPERABLE_BALANCE} USDT")
-                    try:
-                        await tg.send_message(
-                            f"⚠️ *Balance insuficiente*\n"
-                            f"Balance: `{bal:.4f} USDT`\n"
-                            f"Mínimo: `{MIN_OPERABLE_BALANCE} USDT`\n"
-                            f"Deposita fondos para reanudar."
-                        )
-                    except Exception:
-                        pass
-                await asyncio.sleep(3600)
-                continue
-
-            # ── 2. DD check ANTES de update_start_balance ───────────────
-            if not risk.max_daily_loss_ok(bal, cfg.MAX_DAILY_DD_PCT):
-                await asyncio.sleep(3600)
-                continue
-
-            # ── 3. Actualizar start_balance solo con balance sano ────────
+            # ── DD diario ───────────────────────────────────
             risk.update_start_balance(bal)
+            if not risk.max_daily_loss_ok(bal, cfg.MAX_DAILY_DD_PCT):
+                await asyncio.sleep(3600); continue
 
-            if len(active_positions) >= cfg.MAX_OPEN_POSITIONS and symbol not in active_positions:
-                await asyncio.sleep(cfg.LOOP_INTERVAL)
-                continue
+            # ── Límite posiciones ───────────────────────────
+            if symbol not in active_positions and len(active_positions) >= cfg.MAX_OPEN_POSITIONS:
+                await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
+            # ── Velas multi-TF ──────────────────────────────
             results = await asyncio.gather(
                 exchange.get_klines(symbol, "3m",  250),
                 exchange.get_klines(symbol, "15m", 100),
@@ -176,13 +173,13 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
             ohlcv_3m, ohlcv_15m, ohlcv_1h, ohlcv_1m = results
 
             if isinstance(ohlcv_3m, Exception) or len(ohlcv_3m) < 50:
-                await asyncio.sleep(15)
-                continue
+                await asyncio.sleep(15); continue
 
             ohlcv_15m = [] if isinstance(ohlcv_15m, Exception) else ohlcv_15m
             ohlcv_1h  = [] if isinstance(ohlcv_1h,  Exception) else ohlcv_1h
             ohlcv_1m  = [] if isinstance(ohlcv_1m,  Exception) else ohlcv_1m
 
+            # ── Market context (OFI multinivel) ─────────────
             try:
                 mctx = await exchange.get_market_context(symbol, cfg.OFI_LEVELS)
             except Exception:
@@ -191,7 +188,9 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
             mctx["prev_open_interest"] = prev_oi.get(symbol, mctx["open_interest"])
             prev_oi[symbol] = mctx["open_interest"]
 
-            sig    = engine.compute(ohlcv_3m, ohlcv_15m, ohlcv_1h, ohlcv_1m, mctx)
+            # ── Señal ───────────────────────────────────────
+            sig = engine.compute(ohlcv_3m, ohlcv_15m, ohlcv_1h, ohlcv_1m, mctx)
+
             ticker = await exchange.get_ticker(symbol)
             price  = ticker["last"]
 
@@ -242,19 +241,26 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
                                            pnl_pct=pnl, conviction=pos["conv"],
                                            tier=pos["tier"]))
                     del active_positions[symbol]
-                    # Forzar refresco de balance tras cerrar posición
-                    await bal_cache.get(force=True)
 
             # ── Nueva entrada ────────────────────────────────
             if symbol not in active_positions and sig["direction"]:
-                tier  = sig["tier"]
-                conv  = sig["conviction"]
-                min_c = (cfg.MIN_CONV_SUP  if tier == "SUP"  else
-                         cfg.MIN_CONV_FUEL if tier == "FUEL" else cfg.MIN_CONV_STD)
+                tier = sig["tier"]
+                conv = sig["conviction"]
+
+                # [ALT-PRI] Majors necesitan mayor convicción
+                # Research: alpha de microestructura en BTC cayó de +82 a +12bps en 2 años
+                min_c_base = (cfg.MIN_CONV_SUP  if tier == "SUP"  else
+                              cfg.MIN_CONV_FUEL if tier == "FUEL" else cfg.MIN_CONV_STD)
+                min_c = min_c_base + (MAJOR_CONV_PENALTY if is_major else 0)
 
                 if sig.get("vol_regime") == "LOW" or conv < min_c:
-                    await asyncio.sleep(cfg.LOOP_INTERVAL)
-                    continue
+                    await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+
+                # [ALT-PRI] Score umbral más alto para majors
+                score_100 = round(sig.get("norm_score", 0) * 100)
+                score_thr = cfg.SCORE_THR_LONG + (MAJOR_SCORE_PENALTY if is_major else 0)
+                if score_100 < score_thr:
+                    await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
                 sl   = sig["sl"]
                 tp   = sig.get("tp")
@@ -265,8 +271,10 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
                     atr=atr,
                 )
                 if size <= 0:
-                    await asyncio.sleep(cfg.LOOP_INTERVAL)
-                    continue
+                    await asyncio.sleep(cfg.LOOP_INTERVAL); continue
+
+                # [CAT-LOG] Log de catalizadores antes de ejecutar
+                cat_str = _log_catalysts(symbol, sig)
 
                 order_id = "SIGNAL_ONLY"
                 if cfg.MODE == "LIVE":
@@ -277,11 +285,8 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
                         maker_offset_pct=cfg.MAKER_OFFSET_PCT,
                     )
                     if not order:
-                        await asyncio.sleep(cfg.LOOP_INTERVAL)
-                        continue
+                        await asyncio.sleep(cfg.LOOP_INTERVAL); continue
                     order_id = order.get("orderId", "?")
-                    # Refresco de balance tras abrir posición
-                    await bal_cache.get(force=True)
 
                 active_positions[symbol] = dict(
                     side=sig["direction"], entry=price, sl=sl, tp=tp,
@@ -289,10 +294,12 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
                     time=datetime.now(timezone.utc),
                     atr=sig.get("atr_last", 0),
                     trail_active=False, trail_sl=None,
+                    catalysts=cat_str,
                 )
                 await tg.send_entry(symbol, sig, price, size, order_id, mctx)
-                log.info(f"[{symbol}] ✅ {sig['direction']} {tier} conv={conv}/10 "
-                         f"score={sig['norm_score']:.2f} OFI={sig['ofi']:.2f}")
+                log.info(f"[{symbol}] ✅ {sig['direction']} {tier} "
+                         f"conv={conv}/10 score={score_100} "
+                         f"cats=[{cat_str}]")
 
             consecutive_errors = 0
 
@@ -314,20 +321,26 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine, perf, bal_cach
 
 # ─────────────────────────────────────────────────────────────
 #  SCANNER LOOP
+# [ALT-PRI] Altcoins se procesan antes que majors en el mismo ciclo
 # ─────────────────────────────────────────────────────────────
-async def scanner_loop(exchange, tg, perf, engine, risk, session, bal_cache: BalanceCache):
+async def scanner_loop(exchange, tg, perf, engine, risk, session):
     scanner = MarketScanner(exchange)
     tasks   : dict[str, asyncio.Task] = {}
 
     while not _stop_event.is_set():
         try:
-            symbols = await scanner.get_tradeable_symbols()
-            log.info(f"Scanner: {len(symbols)} pares activos")
+            symbols_raw = await scanner.get_tradeable_symbols()
+
+            # [ALT-PRI] Altcoins primero: más edge estadístico en 2026
+            symbols = sorted(symbols_raw, key=lambda s: (1 if _is_major(s) else 0, s))
+            n_alt   = sum(1 for s in symbols if not _is_major(s))
+            n_maj   = len(symbols) - n_alt
+            log.info(f"Scanner: {len(symbols)} pares — {n_alt} altcoins + {n_maj} majors")
 
             gs = perf.global_stats()
             if gs and gs.get("total_trades", 0) > 0:
                 await tg.send_message(
-                    f"🔍 *Scanner — {len(symbols)} pares*\n"
+                    f"🔍 *Scanner — {len(symbols)} pares* ({n_alt} alt / {n_maj} maj)\n"
                     f"WR={gs['win_rate']:.0%} | PF={gs['profit_factor']:.2f} | "
                     f"avg={gs['avg_pnl']:.2f}%\n"
                     f"⛔ Suspendidos: {', '.join(gs['suspended']) or 'ninguno'}"
@@ -336,7 +349,7 @@ async def scanner_loop(exchange, tg, perf, engine, risk, session, bal_cache: Bal
             for sym in symbols:
                 if sym not in tasks or tasks[sym].done():
                     tasks[sym] = asyncio.create_task(
-                        run_symbol(sym, exchange, tg, risk, session, engine, perf, bal_cache)
+                        run_symbol(sym, exchange, tg, risk, session, engine, perf)
                     )
 
             for sym in list(tasks):
@@ -359,11 +372,11 @@ async def scanner_loop(exchange, tg, perf, engine, risk, session, bal_cache: Bal
 # ─────────────────────────────────────────────────────────────
 #  STATUS LOOP
 # ─────────────────────────────────────────────────────────────
-async def status_loop(tg, bal_cache: BalanceCache, perf):
+async def status_loop(tg, exchange, perf):
     while not _stop_event.is_set():
         await asyncio.sleep(3600)
         try:
-            bal = await bal_cache.get(force=True)
+            bal = await exchange.get_balance(force=True)
             await tg.send_status(bal, active_positions, perf.global_stats())
         except asyncio.CancelledError:
             break
@@ -379,12 +392,11 @@ async def main():
     _stop_event = asyncio.Event()
 
     log.info("═══════════════════════════════════════")
-    log.info("  QF×JP Bot v5.7  |  BingX Futures")
-    log.info(f"  SCORE_THR={cfg.SCORE_THR_LONG} | DECAY_THR={cfg.DECAY_THR}")
-    log.info(f"  MAKER_ORDERS={'ON' if cfg.USE_MAKER_ORDERS else 'OFF'}")
+    log.info("  QF×JP Bot v5.6  |  BingX Futures")
+    log.info(f"  OFI_LEVELS={cfg.OFI_LEVELS} (multinivel ponderado)")
+    log.info(f"  MAJOR_PAIRS={len(MAJOR_PAIRS)} pares con umbral +{MAJOR_SCORE_PENALTY}pts")
+    log.info(f"  LOW_LIQ_WINDOW={LOW_LIQ_HOUR_START}-{LOW_LIQ_HOUR_END} UTC (altcoins)")
     log.info(f"  MODE={cfg.MODE} | MAX_POS={cfg.MAX_OPEN_POSITIONS}")
-    log.info(f"  MIN_BALANCE={MIN_OPERABLE_BALANCE} USDT | MAX_DD={cfg.MAX_DAILY_DD_PCT}%")
-    log.info(f"  BALANCE_TTL={BALANCE_TTL}s (llamadas API reducidas)")
     log.info("═══════════════════════════════════════")
 
     tg       = TelegramClient(cfg.TG_TOKEN, cfg.TG_CHAT_ID)
@@ -394,13 +406,10 @@ async def main():
     engine   = QFJPEngine()
     perf     = PerformanceTracker(cfg.PF_WINDOW, cfg.MIN_PROFIT_FACTOR)
 
-    # ── Balance cache centralizado ────────────────────────────
-    bal_cache = BalanceCache(exchange, ttl=BALANCE_TTL)
-
     bal = 0.0
     for attempt in range(5):
         try:
-            bal = await bal_cache.get(force=True)
+            bal = await exchange.get_balance(force=True)
             if bal > 0:
                 break
             await asyncio.sleep(5)
@@ -408,46 +417,31 @@ async def main():
             log.warning(f"Balance intento {attempt+1}/5: {e}")
             await asyncio.sleep(10)
 
-    log.info(f"Balance inicial: {bal:.4f} USDT")
-
-    if bal >= MIN_OPERABLE_BALANCE:
-        risk.update_start_balance(bal)
-    else:
-        log.warning(
-            f"Balance {bal:.4f} USDT < mínimo {MIN_OPERABLE_BALANCE} USDT — "
-            f"esperando depósito para inicializar start_balance"
-        )
+    log.info(f"Balance inicial: {bal:.2f} USDT")
+    risk.update_start_balance(bal)
 
     loop = asyncio.get_event_loop()
-    def _stop():
-        log.info("Señal de parada recibida")
-        _stop_event.set()
     for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
-        loop.add_signal_handler(sig, _stop)
+        loop.add_signal_handler(sig, _graceful_shutdown_sync)
 
     try:
-        maker_fee    = "0.04% (maker)" if cfg.USE_MAKER_ORDERS else "0.15% (market)"
-        balance_line = (
-            f"Balance: `{bal:.2f} USDT`" if bal >= MIN_OPERABLE_BALANCE
-            else f"⚠️ Sin fondos: `{bal:.4f} USDT` — deposita ≥ {MIN_OPERABLE_BALANCE} USDT"
-        )
+        maker_fee = "0.04% (maker)" if cfg.USE_MAKER_ORDERS else "0.15% (market)"
         await tg.send_message(
-            f"🟢 *QF×JP Bot v5.7 iniciado*\n"
-            f"{'🔴 LIVE' if cfg.MODE=='LIVE' else '🟡 SIGNAL ONLY'} | {balance_line}\n"
-            f"Fees: `{maker_fee}` | Trailing SL: `✅`\n"
-            f"Balance cache: `{BALANCE_TTL}s TTL` | Min: `{MIN_OPERABLE_BALANCE} USDT`\n"
-            f"Score: `{cfg.SCORE_THR_LONG*100:.0f}%` | "
-            f"Decay: `{cfg.DECAY_THR*100:.0f}%` | "
-            f"Leverage: `{cfg.LEVERAGE}×`"
+            f"🟢 *QF×JP Bot v5.6 iniciado*\n"
+            f"{'🔴 LIVE' if cfg.MODE=='LIVE' else '🟡 SIGNAL ONLY'} | "
+            f"Balance: `{bal:.2f} USDT`\n"
+            f"Fees: `{maker_fee}` | OFI: `10 niveles` | MultiTF: `✅`\n"
+            f"Altcoins: umbral normal | Majors: `+{MAJOR_SCORE_PENALTY}pts score`\n"
+            f"Filtro 18-23 UTC: `✅ altcoins` | Leverage: `{cfg.LEVERAGE}×`"
         )
     except Exception as e:
         log.warning(f"Telegram startup: {e}")
 
     t_scanner = asyncio.create_task(
-        scanner_loop(exchange, tg, perf, engine, risk, session, bal_cache)
+        scanner_loop(exchange, tg, perf, engine, risk, session)
     )
     t_status = asyncio.create_task(
-        status_loop(tg, bal_cache, perf)
+        status_loop(tg, exchange, perf)
     )
 
     try:
