@@ -1,5 +1,12 @@
 """
-Cliente BingX v5.6 — añadido close() para shutdown limpio sin ResourceWarning
+Cliente BingX v5.7 — OFI multinivel ponderado
+Mejoras sobre v5.6:
+  [OFI-ML] get_ofi usa hasta 10 niveles con pesos decrecientes:
+           nivel 1 tiene peso N, nivel N tiene peso 1.
+           El resultado es más estable y menos manipulable
+           que el top-of-book puro (spread spoofing).
+  [OFI-ML] get_ofi_multilevel devuelve también el desglose
+           por nivel para logging y diagnóstico.
 """
 import asyncio, hashlib, hmac, time, logging
 from urllib.parse import urlencode
@@ -29,7 +36,6 @@ class BingXClient:
         return self._session
 
     async def close(self):
-        """Cierra la sesión aiohttp. Llamar antes de terminar el proceso."""
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -193,17 +199,82 @@ class BingXClient:
             "volume": float(t.get("volume",    0)),
         }
 
-    # ── Market context ───────────────────────────────────────
-    async def get_ofi(self, symbol: str, levels: int = 5) -> float:
+    # ── OFI multinivel ponderado [OFI-ML] ────────────────────
+    async def get_ofi(self, symbol: str, levels: int = 10) -> float:
+        """
+        OFI ponderado con hasta `levels` niveles del orderbook.
+
+        Ponderación lineal decreciente:
+          nivel 1 (top-of-book) → peso = levels
+          nivel N               → peso = 1
+
+        Ventaja sobre OFI simple (nivel 1 solo):
+          · Más robusto ante spoofing en el spread
+          · Captura presión institucional que llega en niveles 2-5
+          · Investigación (Binance Futures 2022-2025) muestra que
+            los niveles 2-5 tienen importancia predictiva comparable
+            al nivel 1 en altcoins de cap media
+
+        Devuelve valor en [-1, +1].
+        """
         try:
-            data  = await self._get("/openApi/swap/v2/quote/depth",
-                                    {"symbol": symbol, "limit": levels * 2})
-            bids  = data.get("bids", []); asks = data.get("asks", [])
-            bid_q = sum(float(b[1]) for b in bids[:levels])
-            ask_q = sum(float(a[1]) for a in asks[:levels])
-            total = bid_q + ask_q
-            return (bid_q - ask_q) / total if total else 0.0
-        except Exception: return 0.0
+            raw  = await self._get("/openApi/swap/v2/quote/depth",
+                                   {"symbol": symbol, "limit": levels * 2})
+            bids = raw.get("bids", [])[:levels]
+            asks = raw.get("asks", [])[:levels]
+
+            bid_w = 0.0
+            ask_w = 0.0
+            n = max(len(bids), len(asks), 1)
+
+            for i, b in enumerate(bids):
+                weight = n - i          # nivel 1 = peso n, nivel n = peso 1
+                bid_w += weight * float(b[1])
+
+            for i, a in enumerate(asks):
+                weight = n - i
+                ask_w += weight * float(a[1])
+
+            total = bid_w + ask_w
+            return (bid_w - ask_w) / total if total else 0.0
+
+        except Exception as e:
+            log.debug(f"get_ofi {symbol}: {e}")
+            return 0.0
+
+    async def get_ofi_detail(self, symbol: str, levels: int = 10) -> dict:
+        """
+        OFI multinivel con desglose por nivel para diagnóstico.
+        Devuelve: {ofi_weighted, ofi_l1, ofi_l3, ofi_l5, depth_ratio}
+        """
+        try:
+            raw  = await self._get("/openApi/swap/v2/quote/depth",
+                                   {"symbol": symbol, "limit": levels * 2})
+            bids = raw.get("bids", [])[:levels]
+            asks = raw.get("asks", [])[:levels]
+
+            def _ofi(b_slice, a_slice, w=None):
+                if w is None:
+                    bq = sum(float(x[1]) for x in b_slice)
+                    aq = sum(float(x[1]) for x in a_slice)
+                else:
+                    n  = max(len(b_slice), len(a_slice), 1)
+                    bq = sum((n-i)*float(x[1]) for i,x in enumerate(b_slice))
+                    aq = sum((n-i)*float(x[1]) for i,x in enumerate(a_slice))
+                t = bq + aq
+                return (bq - aq) / t if t else 0.0
+
+            return {
+                "ofi_weighted": _ofi(bids, asks, w=True),
+                "ofi_l1"      : _ofi(bids[:1], asks[:1]),
+                "ofi_l3"      : _ofi(bids[:3], asks[:3]),
+                "ofi_l5"      : _ofi(bids[:5], asks[:5]),
+                "depth_levels": min(len(bids), len(asks)),
+            }
+        except Exception as e:
+            log.debug(f"get_ofi_detail {symbol}: {e}")
+            return {"ofi_weighted": 0.0, "ofi_l1": 0.0, "ofi_l3": 0.0,
+                    "ofi_l5": 0.0, "depth_levels": 0}
 
     async def get_funding_rate(self, symbol: str) -> float:
         try:
@@ -219,17 +290,21 @@ class BingXClient:
             return float(item.get("openInterest", 0))
         except Exception: return 0.0
 
-    async def get_market_context(self, symbol: str, ofi_levels: int = 5) -> dict:
-        ofi, fr, oi = await asyncio.gather(
+    async def get_market_context(self, symbol: str, ofi_levels: int = 10) -> dict:
+        """
+        Contexto de mercado con OFI multinivel ponderado.
+        ofi_levels=10 por defecto (antes era 5).
+        """
+        ofi_task, fr_task, oi_task = await asyncio.gather(
             self.get_ofi(symbol, ofi_levels),
             self.get_funding_rate(symbol),
             self.get_open_interest(symbol),
             return_exceptions=True
         )
         return {
-            "ofi"          : ofi if isinstance(ofi, float) else 0.0,
-            "funding_rate" : fr  if isinstance(fr,  float) else 0.0,
-            "open_interest": oi  if isinstance(oi,  float) else 0.0,
+            "ofi"          : ofi_task if isinstance(ofi_task, float) else 0.0,
+            "funding_rate" : fr_task  if isinstance(fr_task,  float) else 0.0,
+            "open_interest": oi_task  if isinstance(oi_task,  float) else 0.0,
         }
 
     # ── Positions / Orders ───────────────────────────────────
