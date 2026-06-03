@@ -13,6 +13,7 @@
 ║  ✅ AMD_BOOST=8 → suma puntos al score cuando AMD activo         ║
 ║  ✅ Dashboard AMD en alerta Telegram                             ║
 ║  ✅ Health endpoint incluye amd_signals counter                  ║
+║  ✅ Tabla TradingView grande abajo izquierda                     ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 import asyncio, logging, signal as signal_mod, sys, traceback
@@ -64,7 +65,7 @@ _health: dict = {
     "wins": 0, "losses": 0, "pnl_dia": 0.0,
     "circuit_breaker": False, "racha_perdidas": 0,
     "escaneos": 0, "señales": 0,
-    "amd_signals": 0,          # ← NUEVO: señales AMD confirmadas
+    "amd_signals": 0,
     "ultimo_scan": "—", "ultimo_skip": "—",
 }
 
@@ -234,9 +235,9 @@ async def _registrar_cierre(sym, side, entry, price, pnl_pct,
             except Exception:
                 pass
 
-    trail_str  = " (trailing)" if trail_active else ""
-    amd_tag    = f" | AMD paso {amd_step}/4" if amd_step > 0 else ""
-    resultado  = f"{emoji} {'WIN' if ganado else 'LOSS'} {pnl_pct:+.2f}%{trail_str}"
+    trail_str = " (trailing)" if trail_active else ""
+    amd_tag   = f" | AMD paso {amd_step}/4" if amd_step > 0 else ""
+    resultado = f"{emoji} {'WIN' if ganado else 'LOSS'} {pnl_pct:+.2f}%{trail_str}"
     log.info(f"Cerrado: {sym} {side} | {resultado} | ${pnl_usdt:+.2f} USDT{amd_tag}")
 
     try:
@@ -278,6 +279,211 @@ async def _graceful_shutdown(running_tasks: list, clients: list):
     log.info("Shutdown completado")
 
 # ══════════════════════════════════════════════════════════════════════
+# TABLA TRADINGVIEW — GRANDE, ABAJO IZQUIERDA
+# Generada como Pine Script embebido en las alertas/logs.
+# La función devuelve el bloque Pine listo para pegar en el indicador.
+# ══════════════════════════════════════════════════════════════════════
+PINE_TABLE_BLOCK = """\
+// ════════════════════════════════════════════════════════════════════
+// TABLA GRANDE — ABAJO IZQUIERDA (QF×JP Bot v6.1 + AMD)
+// ════════════════════════════════════════════════════════════════════
+var table dashboard = table.new(
+     position    = position.bottom_left,
+     columns     = 3,
+     rows        = 12,
+     bgcolor      = color.new(color.black, 60),
+     border_color = color.new(color.gray,  50),
+     border_width = 1,
+     frame_color  = color.new(color.blue,  40),
+     frame_width  = 2)
+
+// Colores reutilizables
+var color COL_HDR   = color.new(color.blue,   35)
+var color COL_AMD   = color.new(color.purple, 35)
+var color COL_WIN   = color.new(color.teal,   70)
+var color COL_LOSS  = color.new(color.red,    70)
+var color COL_CELL  = color.new(color.black,  70)
+var color COL_WARN  = color.new(color.orange, 60)
+
+if barstate.islast
+
+    // ── Fila 0: Cabecera principal ─────────────────────────────────
+    table.cell(dashboard, 0, 0, "QF×JP Bot v6.1",
+         text_color=color.white, text_size=size.normal,
+         bgcolor=COL_HDR, text_halign=text.align_left)
+    table.cell(dashboard, 1, 0, "AMD FUSION",
+         text_color=color.yellow, text_size=size.normal,
+         bgcolor=COL_HDR, text_halign=text.align_center)
+    table.cell(dashboard, 2, 0, in_session ? "🟡 ASIA ON" : "⚫ ASIA OFF",
+         text_color=in_session ? color.yellow : color.gray,
+         text_size=size.normal, bgcolor=COL_HDR,
+         text_halign=text.align_right)
+
+    // ── Fila 1: Cabecera sección rango asiático ────────────────────
+    table.cell(dashboard, 0, 1, "RANGO ASIÁTICO",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.navy, 50),
+         text_halign=text.align_left)
+    table.cell(dashboard, 1, 1, "Valor",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.navy, 50),
+         text_halign=text.align_center)
+    table.cell(dashboard, 2, 1, "Estado",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.navy, 50),
+         text_halign=text.align_center)
+
+    // ── Fila 2: Asian High ─────────────────────────────────────────
+    table.cell(dashboard, 0, 2, "Asian High",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 2,
+         not na(asian_high) ? str.tostring(asian_high, "#.######") : "—",
+         text_color=color.red, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_right)
+    table.cell(dashboard, 2, 2,
+         not na(asian_high) and high > asian_high ? "⬆ ROTO" : "—",
+         text_color=high > asian_high ? color.red : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_center)
+
+    // ── Fila 3: Asian Low ──────────────────────────────────────────
+    table.cell(dashboard, 0, 3, "Asian Low",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 3,
+         not na(asian_low) ? str.tostring(asian_low, "#.######") : "—",
+         text_color=color.blue, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_right)
+    table.cell(dashboard, 2, 3,
+         not na(asian_low) and low < asian_low ? "⬇ ROTO" : "—",
+         text_color=low < asian_low ? color.blue : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_center)
+
+    // ── Fila 4: Asian Mid + Range ──────────────────────────────────
+    table.cell(dashboard, 0, 4, "Asian Mid",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 4,
+         not na(asian_mid) ? str.tostring(asian_mid, "#.######") : "—",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_right)
+    table.cell(dashboard, 2, 4,
+         not na(asian_range) ? str.tostring(math.round(asian_range / syminfo.mintick)) + " pips" : "—",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_center)
+
+    // ── Fila 5: Cabecera sección AMD ───────────────────────────────
+    table.cell(dashboard, 0, 5, "PASOS AMD",
+         text_color=color.white, text_size=size.small,
+         bgcolor=COL_AMD, text_halign=text.align_left)
+    table.cell(dashboard, 1, 5, "Señal",
+         text_color=color.white, text_size=size.small,
+         bgcolor=COL_AMD, text_halign=text.align_center)
+    table.cell(dashboard, 2, 5, "Confirmación",
+         text_color=color.white, text_size=size.small,
+         bgcolor=COL_AMD, text_halign=text.align_center)
+
+    // ── Fila 6: Paso 1 Rango + Paso 2 Sweep ───────────────────────
+    table.cell(dashboard, 0, 6, "P1 Rango  P2 Sweep",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 6,
+         (in_session ? "✅ Rng" : "⬜ Rng") + " | " +
+         (is_manipulation_buy or is_manipulation_sell ? "✅ Swp" : "⬜ Swp"),
+         text_color=color.silver, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_center)
+    table.cell(dashboard, 2, 6,
+         is_manipulation_buy ? "🟢 BULL" : is_manipulation_sell ? "🔴 BEAR" : "—",
+         text_color=is_manipulation_buy ? color.green :
+                    is_manipulation_sell ? color.red : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_center)
+
+    // ── Fila 7: Paso 3 Volumen + Paso 4 MSS ───────────────────────
+    table.cell(dashboard, 0, 7, "P3 Vol     P4 MSS",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 7,
+         (is_high_volume ? "✅ Vol" : "⬜ Vol") + " | " +
+         (confirmed_buy or confirmed_sell ? "✅ MSS" : "⬜ MSS"),
+         text_color=color.silver, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_center)
+    table.cell(dashboard, 2, 7,
+         confirmed_buy ? "✅ BUY OK" : confirmed_sell ? "✅ SELL OK" : "Esperando...",
+         text_color=confirmed_buy  ? color.teal  :
+                    confirmed_sell ? color.maroon : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_center)
+
+    // ── Fila 8: Cabecera sección filtros ───────────────────────────
+    table.cell(dashboard, 0, 8, "FILTROS",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.gray, 70),
+         text_halign=text.align_left)
+    table.cell(dashboard, 1, 8, "Actual",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.gray, 70),
+         text_halign=text.align_center)
+    table.cell(dashboard, 2, 8, "Umbral",
+         text_color=color.silver, text_size=size.small,
+         bgcolor=color.new(color.gray, 70),
+         text_halign=text.align_center)
+
+    // ── Fila 9: Volumen ────────────────────────────────────────────
+    vol_ratio_disp = math.round(volume / vol_avg * 100) / 100
+    table.cell(dashboard, 0, 9, "Vol Ratio",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 9,
+         str.tostring(vol_ratio_disp) + "×",
+         text_color=is_high_volume ? color.green : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_right)
+    table.cell(dashboard, 2, 9,
+         "≥ " + str.tostring(vol_mult) + "×",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_center)
+
+    // ── Fila 10: Cuerpo vela + mecha ──────────────────────────────
+    body_ratio_disp = candle_range > 0 ?
+         math.round(candle_body / candle_range * 100) / 100 : 0.0
+    table.cell(dashboard, 0, 10, "Cuerpo / Mecha",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 10,
+         str.tostring(body_ratio_disp) + " / " +
+         str.tostring(math.round(
+             (candle_body > 0 ?
+              math.max(lower_wick, upper_wick) / candle_body : 0) * 10) / 10),
+         text_color=candle_body_ok ? color.green : color.gray,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_right)
+    table.cell(dashboard, 2, 10,
+         "≥" + str.tostring(body_pct) + " / ≥" + str.tostring(wick_ratio),
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_center)
+
+    // ── Fila 11: Sesión + hora UTC ─────────────────────────────────
+    table.cell(dashboard, 0, 11, "Hora UTC",
+         text_color=color.gray, text_size=size.small,
+         bgcolor=COL_CELL, text_halign=text.align_left)
+    table.cell(dashboard, 1, 11,
+         str.format("{0,number,00}:{1,number,00}",
+             hour(time, "UTC"), minute(time, "UTC")),
+         text_color=in_session ? color.yellow : color.silver,
+         text_size=size.small, bgcolor=COL_CELL,
+         text_halign=text.align_right)
+    table.cell(dashboard, 2, 11,
+         in_session ? "SESIÓN ACTIVA" : "Fuera sesión",
+         text_color=in_session ? color.yellow : color.gray,
+         text_size=size.small,
+         bgcolor=in_session ? color.new(color.yellow, 80) : COL_CELL,
+         text_halign=text.align_center)
+"""
+
+# ══════════════════════════════════════════════════════════════════════
 # LOOP POR SÍMBOLO
 # ══════════════════════════════════════════════════════════════════════
 async def run_symbol(symbol, exchange, tg, risk, session, engine,
@@ -285,7 +491,6 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
     log.info(f"[{symbol}] task arrancada")
     consecutive_errors = 0
 
-    # AMD filter stateful por símbolo
     amd = get_amd_filter(symbol)
 
     while not _stop_event.is_set():
@@ -364,11 +569,10 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
             _health["escaneos"]   += 1
 
             # ══════════════════════════════════════════════════════
-            # AMD — EVALUACIÓN (sobre ohlcv_3m, mayor contexto)
+            # AMD — EVALUACIÓN
             # ══════════════════════════════════════════════════════
             amd_sig = amd.update(ohlcv_3m)
 
-            # Si AMD_REQUIRED=true y no hay AMD confirmado → skip entrada
             if amd_sig.blocked and symbol not in active_positions:
                 _skip(f"{symbol} AMD paso {amd_sig.step}/4 (REQUIRED)")
                 await asyncio.sleep(cfg.LOOP_INTERVAL); continue
@@ -449,7 +653,6 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
                 min_c = (cfg.MIN_CONV_SUP  if tier == "SUP"  else
                          cfg.MIN_CONV_FUEL if tier == "FUEL" else cfg.MIN_CONV_STD)
 
-                # ── Filtro STD_AUTOTRADE ──────────────────────────
                 if tier == "STD" and not STD_AUTOTRADE:
                     _skip(f"{symbol} STD ignorado (STD_AUTOTRADE=false)")
                     await asyncio.sleep(cfg.LOOP_INTERVAL); continue
@@ -462,10 +665,6 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
                     _skip(f"{symbol} conv {conv} < min {min_c} para {tier}")
                     await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
-                # ── AMD: validación de dirección ──────────────────
-                # Si AMD está en paso 4, valida que la dirección coincida
-                # Si AMD está en pasos 1-3, solo bloquea si AMD_REQUIRED=true
-                # y la dirección AMD contradice la señal QF
                 amd_conflict = (
                     amd_sig.step == 4
                     and amd_sig.direction is not None
@@ -478,7 +677,6 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
                     )
                     await asyncio.sleep(cfg.LOOP_INTERVAL); continue
 
-                # Boost de score cuando AMD completo y alineado
                 amd_score_boost = amd_sig.boost if amd_sig.step == 4 else 0
 
                 sl   = sig["sl"]
@@ -517,7 +715,7 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
                     atr=sig.get("atr_last", 0),
                     trail_active=False, trail_sl=None,
                     usdt_size=usdt_size,
-                    amd_step=amd_sig.step,          # ← guardamos paso AMD
+                    amd_step=amd_sig.step,
                 )
                 _health["trades_abiertos"] = len(active_positions)
                 _health["señales"]        += 1
@@ -526,7 +724,6 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
                 if amd_sig.step == 4:
                     _health["amd_signals"] += 1
 
-                # Alerta Telegram enriquecida con AMD
                 await _enviar_alerta_entrada(
                     tg, symbol, sig, price, size,
                     order_id, mctx, conv, tier,
@@ -551,7 +748,9 @@ async def run_symbol(symbol, exchange, tg, risk, session, engine,
             log.error(f"[{symbol}] error #{consecutive_errors}: {e}")
             if consecutive_errors >= 10:
                 try:
-                    await tg.send_message(f"⚠️ [{symbol}] {consecutive_errors} errores — pausa 10min")
+                    await tg.send_message(
+                        f"⚠️ [{symbol}] {consecutive_errors} errores — pausa 10min"
+                    )
                 except Exception: pass
                 await asyncio.sleep(600)
                 consecutive_errors = 0
@@ -591,21 +790,20 @@ async def _enviar_alerta_entrada(tg, symbol, sig, price, size,
         # ── Bloque AMD ─────────────────────────────────────────────
         amd_lines = ""
         if amd_sig is not None:
-            amd_step = amd_sig.step
-            step_bar = "■" * amd_step + "□" * (4 - amd_step)
-            amd_dir  = amd_sig.direction or "—"
+            amd_step  = amd_sig.step
+            step_bar  = "■" * amd_step + "□" * (4 - amd_step)
+            amd_dir   = amd_sig.direction or "—"
 
             if amd_sig.step == 4:
-                amd_header = f"🎯 *AMD {amd_dir} CONFIRMADO*"
+                amd_header    = f"🎯 *AMD {amd_dir} CONFIRMADO*"
                 amd_boost_str = f"+{amd_boost}pts" if amd_boost else ""
             elif amd_sig.step >= 2:
-                amd_header = f"⚡ AMD paso {amd_step}/4"
+                amd_header    = f"⚡ AMD paso {amd_step}/4"
                 amd_boost_str = ""
             else:
-                amd_header = f"○ AMD paso {amd_step}/4 (sin confirmar)"
+                amd_header    = f"○ AMD paso {amd_step}/4 (sin confirmar)"
                 amd_boost_str = ""
 
-            # Detalle de cada paso
             p1 = "✅" if amd_sig.asian_range else "⬜"
             p2 = "✅" if (amd_sig.sweep_low or amd_sig.sweep_high) else "⬜"
             p3 = "✅" if amd_sig.high_vol else "⬜"
@@ -796,7 +994,9 @@ async def main():
     if bal >= MIN_OPERABLE_BALANCE:
         risk.update_start_balance(bal)
     else:
-        log.warning(f"Balance {bal:.4f} < mínimo {MIN_OPERABLE_BALANCE} — esperando depósito")
+        log.warning(
+            f"Balance {bal:.4f} < mínimo {MIN_OPERABLE_BALANCE} — esperando depósito"
+        )
 
     loop = asyncio.get_event_loop()
     def _stop():
