@@ -23,14 +23,14 @@ from typing import Optional
 log = logging.getLogger("AMD")
 
 # ── Configuración por env vars ─────────────────────────────────────────
-ASIA_START_UTC   = int(os.getenv("AMD_ASIA_START",  "0"))   # hora inicio rango
-ASIA_END_UTC     = int(os.getenv("AMD_ASIA_END",    "8"))   # hora fin rango
-VOL_MULT         = float(os.getenv("AMD_VOL_MULT",  "1.5")) # multiplicador volumen institucional
-VOL_MA_LEN       = int(os.getenv("AMD_VOL_MA_LEN",  "20")) # período media volumen
-SWEEP_MIN_PCT    = float(os.getenv("AMD_SWEEP_PCT", "0.05"))# penetración mínima (% del rango)
-MSS_BARS         = int(os.getenv("AMD_MSS_BARS",    "3"))   # velas para confirmar MSS
+ASIA_START_UTC   = int(os.getenv("AMD_ASIA_START",  "0"))    # hora inicio rango
+ASIA_END_UTC     = int(os.getenv("AMD_ASIA_END",    "8"))    # hora fin rango
+VOL_MULT         = float(os.getenv("AMD_VOL_MULT",  "1.5"))  # multiplicador volumen institucional
+VOL_MA_LEN       = int(os.getenv("AMD_VOL_MA_LEN",  "20"))  # período media volumen
+SWEEP_MIN_PCT    = float(os.getenv("AMD_SWEEP_PCT", "0.05")) # penetración mínima (% del rango)
+MSS_BARS         = int(os.getenv("AMD_MSS_BARS",    "3"))    # velas para confirmar MSS
 AMD_REQUIRED     = os.getenv("AMD_REQUIRED", "false").lower() == "true"  # True = bloquea sin AMD
-AMD_BOOST        = int(os.getenv("AMD_BOOST", "8"))          # puntos de score boost por AMD confirmado
+AMD_BOOST        = int(os.getenv("AMD_BOOST", "8"))           # puntos de score boost por AMD confirmado
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -39,7 +39,7 @@ AMD_BOOST        = int(os.getenv("AMD_BOOST", "8"))          # puntos de score b
 @dataclass
 class AsianRange:
     high: float
-    low: float
+    low:  float
     date: str  # YYYY-MM-DD UTC
 
     @property
@@ -53,18 +53,18 @@ class AsianRange:
 @dataclass
 class AMDSignal:
     """Resultado del análisis AMD para una barra concreta."""
-    direction: Optional[str]       = None   # "LONG" | "SHORT" | None
-    step:      int                 = 0      # 0-4: hasta qué paso llegó
-    boost:     int                 = 0      # puntos extra de score
-    blocked:   bool                = False  # True si AMD_REQUIRED y no hay señal
+    direction:   Optional[str]          = None   # "LONG" | "SHORT" | None
+    step:        int                    = 0      # 0-4: hasta qué paso llegó
+    boost:       int                    = 0      # puntos extra de score
+    blocked:     bool                   = False  # True si AMD_REQUIRED y no hay señal
 
     # Contexto debug
-    asian_range: Optional[AsianRange] = None
-    sweep_low:   bool              = False
-    sweep_high:  bool              = False
-    high_vol:    bool              = False
-    mss_bull:    bool              = False
-    mss_bear:    bool              = False
+    asian_range: Optional[AsianRange]   = None
+    sweep_low:   bool                   = False
+    sweep_high:  bool                   = False
+    high_vol:    bool                   = False
+    mss_bull:    bool                   = False
+    mss_bear:    bool                   = False
 
     def __repr__(self):
         return (
@@ -88,12 +88,12 @@ class AMDFilter:
     """
 
     def __init__(self, symbol: str = ""):
-        self.symbol = symbol
-        self._asian_range: Optional[AsianRange] = None
-        self._pending_bull_mss: bool  = False
-        self._pending_bear_mss: bool  = False
-        self._mss_bull_level:  float  = 0.0
-        self._mss_bear_level:  float  = 0.0
+        self.symbol                = symbol
+        self._asian_range:  Optional[AsianRange] = None
+        self._pending_bull_mss:    bool  = False
+        self._pending_bear_mss:    bool  = False
+        self._mss_bull_level:      float = 0.0
+        self._mss_bear_level:      float = 0.0
 
     # ── helpers ────────────────────────────────────────────────────────
     @staticmethod
@@ -124,7 +124,6 @@ class AMDFilter:
         if not ohlcv:
             return None
 
-        # Excluir la vela actual del rango
         historical = ohlcv[:-1]
         if not historical:
             return None
@@ -144,11 +143,9 @@ class AMDFilter:
                         rl = min(rl, bar["low"])
             return rh, rl
 
-        # Intentar con el día actual primero
         r_high, r_low = _scan(historical, last_date)
 
         if r_high is None:
-            # Día anterior
             prev_dates = sorted({self._bar_date_utc(b["timestamp"]) for b in historical})
             if len(prev_dates) >= 1:
                 prev_date = prev_dates[-1] if prev_dates[-1] != last_date else (
@@ -186,17 +183,14 @@ class AMDFilter:
         sig.step        = 1
         self._asian_range = rng
 
-        cur  = ohlcv[-1]
-        atr_ = self._atr(ohlcv, 10)  # ATR rápido para umbral sweep
+        cur   = ohlcv[-1]
+        atr_  = self._atr(ohlcv, 10)
 
-        # Penetración mínima: el mayor entre % del rango y 0.01×ATR
         min_sweep_abs = max(rng.size * (SWEEP_MIN_PCT / 100), atr_ * 0.01)
 
         # ── PASO 2: Sweep / manipulación ───────────────────────────
-        # Sweep bajista (bull setup): wick bajo asian_low, cierre dentro
         sweep_low  = (cur["low"]  < rng.low  - min_sweep_abs and
                       cur["close"] > rng.low)
-        # Sweep alcista (bear setup): wick sobre asian_high, cierre dentro
         sweep_high = (cur["high"] > rng.high + min_sweep_abs and
                       cur["close"] < rng.high)
 
@@ -204,7 +198,6 @@ class AMDFilter:
         sig.sweep_high = sweep_high
 
         if not sweep_low and not sweep_high:
-            # Revisar las últimas MSS_BARS+2 velas por si el sweep ya ocurrió
             sweep_low, sweep_high = self._recent_sweep(ohlcv, rng, min_sweep_abs)
             sig.sweep_low  = sweep_low
             sig.sweep_high = sweep_high
@@ -222,7 +215,6 @@ class AMDFilter:
         sig.high_vol = high_vol
 
         if not high_vol:
-            # Revisar si alguna de las últimas velas tuvo el volumen
             high_vol = self._recent_high_vol(ohlcv, vol_ma)
             sig.high_vol = high_vol
             if not high_vol:
@@ -233,10 +225,8 @@ class AMDFilter:
         sig.step = 3
 
         # ── PASO 4: MSS (Market Structure Shift) ───────────────────
-        # MSS Bull: cierre rompe el high de las últimas MSS_BARS velas
-        # MSS Bear: cierre rompe el low  de las últimas MSS_BARS velas
-        recent_highs = [b["high"]  for b in ohlcv[-(MSS_BARS + 2):-1]]
-        recent_lows  = [b["low"]   for b in ohlcv[-(MSS_BARS + 2):-1]]
+        recent_highs   = [b["high"] for b in ohlcv[-(MSS_BARS + 2):-1]]
+        recent_lows    = [b["low"]  for b in ohlcv[-(MSS_BARS + 2):-1]]
         mss_bull_level = max(recent_highs) if recent_highs else 0
         mss_bear_level = min(recent_lows)  if recent_lows  else float("inf")
 
@@ -247,17 +237,15 @@ class AMDFilter:
         sig.mss_bear = mss_bear
 
         if not mss_bull and not mss_bear:
-            # Activar pending para próximas velas
             if sweep_low  and not self._pending_bull_mss:
-                self._pending_bull_mss  = True
-                self._mss_bull_level    = mss_bull_level
+                self._pending_bull_mss = True
+                self._mss_bull_level   = mss_bull_level
                 log.debug(f"[{self.symbol}] AMD pending bull MSS > {mss_bull_level:.6f}")
             if sweep_high and not self._pending_bear_mss:
-                self._pending_bear_mss  = True
-                self._mss_bear_level    = mss_bear_level
+                self._pending_bear_mss = True
+                self._mss_bear_level   = mss_bear_level
                 log.debug(f"[{self.symbol}] AMD pending bear MSS < {mss_bear_level:.6f}")
 
-            # Verificar pending de iteraciones anteriores
             if self._pending_bull_mss and cur["close"] > self._mss_bull_level:
                 mss_bull = True
                 sig.mss_bull = True
@@ -267,7 +255,7 @@ class AMDFilter:
                 sig.mss_bear = True
                 self._pending_bear_mss = False
 
-        # Invalidar pending si precio re-rompe el rango en sentido contrario
+        # Invalidar pending si precio re-rompe en sentido contrario
         if self._pending_bull_mss and cur["close"] < rng.low * 0.998:
             self._pending_bull_mss = False
             log.debug(f"[{self.symbol}] AMD bull MSS pending invalidado")
@@ -282,7 +270,7 @@ class AMDFilter:
 
         # ── AMD COMPLETO ────────────────────────────────────────────
         sig.step      = 4
-        sig.direction = "LONG"  if mss_bull else "SHORT"
+        sig.direction = "LONG" if mss_bull else "SHORT"
         sig.boost     = AMD_BOOST
 
         log.info(
@@ -293,10 +281,8 @@ class AMDFilter:
 
     # ── utilidades privadas ────────────────────────────────────────────
     def _recent_sweep(self, ohlcv, rng: AsianRange, min_sweep_abs: float,
-                       lookback: int = 5) -> tuple[bool, bool]:
-        """Busca sweep en las últimas `lookback` velas (no solo la actual)."""
-        sweep_low  = False
-        sweep_high = False
+                      lookback: int = 5) -> tuple[bool, bool]:
+        sweep_low = sweep_high = False
         for bar in ohlcv[-lookback:]:
             if bar["low"]  < rng.low  - min_sweep_abs and bar["close"] > rng.low:
                 sweep_low  = True
@@ -305,7 +291,6 @@ class AMDFilter:
         return sweep_low, sweep_high
 
     def _recent_high_vol(self, ohlcv, vol_ma: float, lookback: int = 5) -> bool:
-        """Verifica si alguna vela reciente tuvo volumen institucional."""
         return any(b["volume"] > vol_ma * VOL_MULT for b in ohlcv[-lookback:])
 
     @staticmethod
