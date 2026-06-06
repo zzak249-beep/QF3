@@ -1,12 +1,22 @@
 """
-QF×JP Engine v5.5 — integra Pine Script v3.2 completo
-  [M1] Decay adaptativo — OR percentil histórico IC
-  [M2] Pesos dinámicos ADX — tendencia/lateral
-  [M3] CVD rodante sin deriva (ventana fija)
-  [M4] FVG tracking múltiple (ya estaba)
-  [M5] Conv-Boost — convicción sube score compuesto
-  [M6] Filtro volatilidad mínima ATR
-  + L13 OFI / L14 FR / L15 OI (v5)
+QF×JP Engine v6.2 — FIXES señales bloqueadas
+============================================
+Cambios vs v5.5:
+  [F1] vol_ok: ya NO bloquea vol_regime HIGH — solo bloquea LOW
+       Los breakouts de alta volatilidad son entradas reales
+  [F2] Cascada de señales simplificada:
+       long_base ya NO requiere ab_v + se_v como hard gates
+       → pasan a ser bonus de convicción (+1 cada uno)
+       → long_std solo requiere long_base (sin doble filtro asimetría+swing)
+  [F3] Decay menos restrictivo:
+       alive = decay>=DECAY_THR OR ic_r>=percentil adaptativo (sin cambio)
+       DECAY_THR bajado a 0.25 por defecto (era 0.40)
+  [F4] Thresholds de score bajados para más señales STD/FUEL:
+       SC_STD  42 (era 50), SC_FUEL 55 (era 63), SC_SUP 70 (era 75)
+  [F5] htf_bull como bonus, no hard gate para STD:
+       long_std puede entrar sin htf_bull si comp_long es alto (≥ SC_FUEL)
+       para SUP/FUEL sigue siendo requerido
+  [F6] Nuevo campo vol_regime_ok para logs
 """
 import numpy as np
 import pandas as pd
@@ -30,7 +40,7 @@ def _sma(s, p): return pd.Series(s).rolling(p, min_periods=1).mean().values
 def _std(s, p): return pd.Series(s).rolling(p, min_periods=2).std(ddof=0).fillna(0).values
 def _high(s,p): return pd.Series(s).rolling(p, min_periods=1).max().values
 def _low(s, p): return pd.Series(s).rolling(p, min_periods=1).min().values
-def _roll_sum(s, p): return pd.Series(s).rolling(p, min_periods=1).sum().values   # [M3]
+def _roll_sum(s, p): return pd.Series(s).rolling(p, min_periods=1).sum().values
 def _corr(a, b, p):
     return pd.Series(a).rolling(p, min_periods=max(5,p//2)).corr(pd.Series(b)).fillna(0).values
 def _safe(a, b, fill=0.0):
@@ -60,9 +70,7 @@ def _linreg(s, p):
         c = np.polyfit(x, y, 1); out[i] = np.polyval(c, p-1)
     return out
 
-# ── [M2] ADX ────────────────────────────────────────────────
 def _adx(h, l, c, p=14):
-    """Devuelve (adx, dmi_plus, dmi_minus)."""
     n = len(c)
     pc = np.roll(c,1); pc[0]=c[0]
     ph = np.roll(h,1); ph[0]=h[0]
@@ -112,10 +120,10 @@ class Signal:
     above_vwap   : bool  = False
     trending     : bool  = False
     vol_regime   : str   = "NORMAL"
-    vol_ok_atr   : bool  = True      # [M6]
-    adx_val      : float = 0.0       # [M2]
+    vol_ok_atr   : bool  = True
+    adx_val      : float = 0.0
     adx_trend    : bool  = False
-    comp_long    : int   = 0         # [M5] score compuesto 0-100
+    comp_long    : int   = 0
     comp_short   : int   = 0
     ofi          : float = 0.0
     ofi_bull     : bool  = False
@@ -129,6 +137,9 @@ class Signal:
     htf_1h_bull  : bool  = False
     htf_1h_bear  : bool  = False
     multi_tf_aligned: bool = False
+    # [F6] debug
+    vol_regime_blocked: bool = False
+    decay_blocked      : bool = False
 
 
 class QFJPEngine:
@@ -150,15 +161,14 @@ class QFJPEngine:
         # ── [M2] ADX ────────────────────────────────────────
         adx_v, dmi_p, dmi_m = _adx(h, l, c, cfg.ADX_LEN)
         trend_strong = adx_v >= cfg.ADX_TREND_THR
-        trend_up     = (dmi_p > dmi_m) & trend_strong
         adx_factor   = np.minimum(1.0, adx_v / (cfg.ADX_TREND_THR * 2.0))
 
-        # ── [M2] Pesos dinámicos ─────────────────────────────
+        # ── Pesos dinámicos ──────────────────────────────────
         w_mom_dyn = cfg.W_MOM * (1 + adx_factor * 0.40)
         w_rev_dyn = np.maximum(cfg.W_REV * 0.30, cfg.W_REV * (1 - adx_factor * 0.50))
         w_tot     = w_mom_dyn + w_rev_dyn + cfg.W_VOL
 
-        # ── L2 Factores ─────────────────────────────────────
+        # ── Factores ─────────────────────────────────────────
         cs = np.roll(c, cfg.MOM_LEN); cs[:cfg.MOM_LEN] = c[:cfg.MOM_LEN]
         f_mom = _safe(
             _safe(c-cs, np.where(cs>1e-12,cs,np.nan)),
@@ -175,41 +185,40 @@ class QFJPEngine:
         sc_s  = _std(comp, cfg.DECAY_LEN)
         norm  = np.nan_to_num(_tanh(_safe(comp, np.where(sc_s>1e-12,sc_s,np.nan))))
 
-        # ── [M1] Decay adaptativo ────────────────────────────
+        # ── [M1] Decay adaptativo — RELAJADO [F3] ────────────
         fwd   = _safe(np.diff(c, prepend=c[0]), c)
         ic    = _corr(np.roll(norm,1), fwd, cfg.DECAY_LEN)
         ic_r  = _ema(np.abs(np.nan_to_num(ic)), cfg.SMO_LEN)
         ic_pk = _high(ic_r, cfg.DECAY_LEN)
         decay = np.nan_to_num(_safe(ic_r, np.where(ic_pk>1e-12,ic_pk,np.nan), fill=0.5), nan=0.5)
-        # OR percentil (evita bloqueo crónico en 3min)
         win3  = cfg.DECAY_LEN * 3
         ic_adapt = np.array([
             np.percentile(ic_r[max(0,i-win3):i+1], cfg.DECAY_ADAPT_PCT)
             for i in range(n)
         ])
+        # [F3] threshold bajado: usa DECAY_THR del config (default ahora 0.25)
         alive = (decay >= cfg.DECAY_THR) | (ic_r >= ic_adapt)
 
-        # ── L1 Spread ────────────────────────────────────────
-        hl_r    = np.where((h-l)<1e-12, 1e-12, h-l)
+        # ── Spread / exec ────────────────────────────────────
         spread_e= _sma(np.log(np.where(l>1e-12,h/l,1.0)), cfg.SPL_LEN) * c
         bp_drain= _safe(spread_e, c) * 100
         exec_ok = bp_drain < cfg.BP_THR
 
-        # ── [M6] Filtro volatilidad ATR ─────────────────────
-        atr_pct  = _safe(atr_v, c) * 100
-        atr_avg20= _sma(atr_pct, 20)
+        # ── [M6] Volatilidad ATR ─────────────────────────────
+        atr_pct   = _safe(atr_v, c) * 100
+        atr_avg20 = _sma(atr_pct, 20)
         vol_ok_atr = atr_pct >= (atr_avg20 * cfg.VOL_ATR_THR)
 
         # ── HTF 15m ──────────────────────────────────────────
-        c15 = df15["close"].values
+        c15 = df15["close"].values if len(df15) >= 22 else c
         htf_bull_v = bool(_ema(c15,9)[-1] > _ema(c15,21)[-1])
 
-        # ── L4 Dark Pool ─────────────────────────────────────
+        # ── Dark Pool ─────────────────────────────────────────
         vb      = _sma(v, cfg.DP_BASE)
         dp_buy  = (v > vb*cfg.DP_MULT) & ((h-l)<atr_v*0.6) & (c>o)
         dp_sell = (v > vb*cfg.DP_MULT) & ((h-l)<atr_v*0.6) & (c<o)
 
-        # ── L6 Asimetría ─────────────────────────────────────
+        # ── Asimetría ─────────────────────────────────────────
         ur = np.where(c>o, h-l, 0.0); dr = np.where(c<o, h-l, 0.0)
         aur= _sma(ur,cfg.ASY_LEN);    adr= _sma(dr,cfg.ASY_LEN)
         rb = _safe(aur, np.where(adr>1e-12,adr,np.nan), fill=1.0)
@@ -217,25 +226,26 @@ class QFJPEngine:
         ab = rb  >= cfg.ARR
         abe= rbe >= cfg.ABR
 
-        # ── L7 Trendlines ────────────────────────────────────
+        # ── Trendlines ────────────────────────────────────────
         ph_a = _pivot_h(h, cfg.TL_LEFT, cfg.TL_RIGHT)
         pl_a = _pivot_l(l, cfg.PL_LEFT, cfg.PL_RIGHT)
         tl_bl, tl_bs = self._tl_breaks(h,l,c,atr_v,ph_a,pl_a,n)
 
-        # ── L8 Swing ─────────────────────────────────────────
+        # ── Swing ─────────────────────────────────────────────
         se, be2, lsl, lsh = self._swing(h,l,c,pl_a,ph_a,n)
 
-        # ── L9 FVG ───────────────────────────────────────────
+        # ── FVG ───────────────────────────────────────────────
         _,_,ibfvg,ibervg = self._fvg(h,l,c,atr_v)
 
-        # ── L10 OB ───────────────────────────────────────────
+        # ── OB ────────────────────────────────────────────────
         _,_,ibob,iberob  = self._ob(o,h,l,c,atr_v)
 
-        # ── [M3] CVD rodante (ventana fija, sin deriva) ──────
+        # ── [M3] CVD rodante ─────────────────────────────────
+        hl_r = np.where((h-l)<1e-12, 1e-12, h-l)
         bvol = np.where(hl_r>1e-12, ((c-l)/hl_r)*v, v*0.5)
         svol = np.where(hl_r>1e-12, ((h-c)/hl_r)*v, v*0.5)
         delta_bar = bvol - svol
-        cvd      = _roll_sum(delta_bar, cfg.CVD_ROLL)   # [M3] rodante
+        cvd      = _roll_sum(delta_bar, cfg.CVD_ROLL)
         cvd_e    = _ema(cvd, cfg.CVD_LEN)
         cvdr     = cvd > cvd_e
         dw       = cfg.CVD_DIV
@@ -244,7 +254,7 @@ class QFJPEngine:
             cvdbd[dw:] = (c[dw:]<c[:-dw]) & (cvd[dw:]>cvd[:-dw])
             cvdad[dw:] = (c[dw:]>c[:-dw]) & (cvd[dw:]<cvd[:-dw])
 
-        # ── L12 Squeeze ──────────────────────────────────────
+        # ── Squeeze ──────────────────────────────────────────
         sqb, sqbe, sqon = self._squeeze(h,l,c,atr_v)
 
         # ── VWAP ─────────────────────────────────────────────
@@ -252,16 +262,16 @@ class QFJPEngine:
         vwap  = _safe(np.cumsum(((h+l+c)/3)*v), np.where(cum_v>1e-12,cum_v,np.nan))
         avwap = c > np.nan_to_num(vwap)
 
-        # ── Vol regime (original) ────────────────────────────
+        # ── Vol regime ────────────────────────────────────────
         vol_ratio= _safe(atr_pct, np.where(atr_avg20>1e-12,atr_avg20,np.nan), fill=1.0)
         vol_regime_arr = np.where(vol_ratio<0.6,"LOW",
                          np.where(vol_ratio>2.5,"HIGH","NORMAL"))
 
-        # ── Trend gap ────────────────────────────────────────
+        # ── Trend gap ─────────────────────────────────────────
         ema9  = _ema(c,9); ema21 = _ema(c,21)
         trend_v = _safe(np.abs(ema9-ema21), c)*100 > 0.15
 
-        # ── 1h / 1m ─────────────────────────────────────────
+        # ── 1h / 1m ──────────────────────────────────────────
         htf_1h_bull = htf_1h_bear = tf1m_bull = tf1m_bear = False
         if raw1h and len(raw1h)>=22 and cfg.USE_1H_FILTER:
             c1h = self._df(raw1h)["close"].values
@@ -272,7 +282,7 @@ class QFJPEngine:
             tf1m_bull = bool(_ema(c1m,9)[-1]>_ema(c1m,21)[-1])
             tf1m_bear = not tf1m_bull
 
-        # ── L13/14/15 ────────────────────────────────────────
+        # ── L13/14/15 OFI / FR / OI ──────────────────────────
         ofi_val   = ctx.get("ofi",0.0) if ctx else 0.0
         fr_val    = ctx.get("funding_rate",0.0) if ctx else 0.0
         oi_cur    = ctx.get("open_interest",0.0) if ctx else 0.0
@@ -282,9 +292,8 @@ class QFJPEngine:
         ofi_bear_w= ofi_val < -cfg.OFI_THR_WEAK
         fr_bull   = fr_val  >  cfg.FR_BULL_THR
         fr_bear   = fr_val  <  cfg.FR_BEAR_THR
-        fr_extreme= fr_val  >  cfg.FR_EXTREME_THR
+        fr_extreme= abs(fr_val) > cfg.FR_EXTREME_THR   # bilateral
         oi_rising = oi_delta >  cfg.OI_DELTA_THR
-        oi_falling= oi_delta < -cfg.OI_DELTA_THR
 
         # ── Valores finales ──────────────────────────────────
         i = n-1
@@ -309,9 +318,7 @@ class QFJPEngine:
         h1ok_l = (not cfg.USE_1H_FILTER) or htf_1h_bull
         h1ok_s = (not cfg.USE_1H_FILTER) or htf_1h_bear
 
-        # ══════════════════════════════════════════════════════
-        #  SCORE COMPUESTO 0-100 (como Pine v3.2)
-        # ══════════════════════════════════════════════════════
+        # ── Score compuesto 0-100 ────────────────────────────
         ns_n   = (np.tanh(ns) + 1) / 2
         mom_n  = (np.tanh(float(f_mom[i]) * 2) + 1) / 2
         dec_n  = min(1.0, dr_v)
@@ -327,18 +334,23 @@ class QFJPEngine:
         cb_s_base = int((W_SC*(1-ns_n) + W_CVD*(1-cvd_sc) + W_MOM*(1-mom_n) + W_DEC*dec_n + W_HTF*htf_asym_s)*100)
 
         # ── Conviction 0-10 ──────────────────────────────────
+        # [F2] ab_v y se_v ya NO son hard gates — contribuyen a conviction
         long_conv = sum([
             ns > 0.10, alv, exok, htf_bull_v,
-            ab_v, se_v, tlbl, dpb, cvdr_v,
+            ab_v,                                    # [F2] bonus (ya no gate)
+            se_v,                                    # [F2] bonus (ya no gate)
+            tlbl, dpb, cvdr_v,
             (sqb_v or ibf or ibo),
             avwap_v and trd_v,
             ofi_bull_w, fr_bull, oi_rising,
-            bool(adx_str and adx_v[i]>0 and dmi_p[i]>dmi_m[i]),  # ADX alcista
-            volatr,                                                  # [M6]
+            bool(adx_str and adx_now>0 and dmi_p[i]>dmi_m[i]),
+            volatr,
         ])
         short_conv = sum([
             ns < -0.10, alv, exok, not htf_bull_v,
-            abe_v, be_v, tlbs, dps, not cvdr_v,
+            abe_v,
+            be_v,
+            tlbs, dps, not cvdr_v,
             (sqbe_v or ibef or ibeo),
             (not avwap_v) and trd_v,
             ofi_bear_w, fr_bear, oi_rising,
@@ -348,29 +360,43 @@ class QFJPEngine:
         long_conv  = min(long_conv,  10)
         short_conv = min(short_conv, 10)
 
-        # ── [M5] Conv-Boost ──────────────────────────────────
+        # ── Conv-Boost ───────────────────────────────────────
         comp_long  = min(100, cb_l_base + int(long_conv  * 0.5))
         comp_short = min(100, cb_s_base + int(short_conv * 0.5))
 
-        # ── Señales (igual que Pine) ─────────────────────────
+        # ═══════════════════════════════════════════════════════
+        # SEÑALES — [F1] vol_ok NO bloquea HIGH, [F2] sin ab/se gates
+        # ═══════════════════════════════════════════════════════
         SC_STD=cfg.SC_THR_STD; SC_FUEL=cfg.SC_THR_FUEL; SC_SUP=cfg.SC_THR_SUP
-        vol_ok = (vol_reg == "NORMAL") and volatr  # [M6]
 
-        long_base  = (comp_long  >= SC_STD and exok and alv and vol_ok
-                      and htf_bull_v and h1ok_l and not fr_extreme)
-        long_std   = long_base  and ab_v and se_v
-        long_fuel  = long_std   and comp_long >= SC_FUEL and (
-                        tlbl or sqb_v or ((ibf or ibo) and cvdr_v))
-        long_sup   = long_fuel  and comp_long >= SC_SUP  and (dpb or cvdbd_v)
+        # [F1] vol NOT LOW (permite NORMAL y HIGH)
+        vol_not_low = (vol_reg != "LOW") and volatr
 
-        short_base = (comp_short >= SC_STD and exok and alv and vol_ok
-                      and not htf_bull_v and h1ok_s)
-        short_std  = short_base  and abe_v and be_v
-        short_fuel = short_std   and comp_short >= SC_FUEL and (
-                        tlbs or sqbe_v or ((ibef or ibeo) and not cvdr_v))
-        short_sup  = short_fuel  and comp_short >= SC_SUP  and (dps or cvdad_v)
+        # [F5] HTF opcional para STD puro cuando score es alto
+        htf_long_ok  = htf_bull_v or (comp_long  >= SC_FUEL)  # STD puede entrar sin htf si score alto
+        htf_short_ok = (not htf_bull_v) or (comp_short >= SC_FUEL)
 
-        # ── Multi-TF bonus conviction ─────────────────────────
+        long_base  = (comp_long  >= SC_STD and exok and alv and vol_not_low
+                      and h1ok_l and not fr_extreme and htf_long_ok)
+
+        short_base = (comp_short >= SC_STD and exok and alv and vol_not_low
+                      and h1ok_s and not fr_extreme and htf_short_ok)
+
+        # [F2] STD solo requiere base — sin ab_v/se_v obligatorios
+        long_std   = long_base
+        short_std  = short_base
+
+        # FUEL: requiere HTF confirmado + al menos 1 señal estructural
+        long_fuel  = (long_std and htf_bull_v and comp_long >= SC_FUEL and (
+                        tlbl or sqb_v or ((ibf or ibo) and cvdr_v) or ab_v or se_v))
+        short_fuel = (short_std and not htf_bull_v and comp_short >= SC_FUEL and (
+                        tlbs or sqbe_v or ((ibef or ibeo) and not cvdr_v) or abe_v or be_v))
+
+        # SUP: máxima confirmación
+        long_sup   = (long_fuel and comp_long  >= SC_SUP and (dpb or cvdbd_v))
+        short_sup  = (short_fuel and comp_short >= SC_SUP and (dps or cvdad_v))
+
+        # ── Multi-TF bonus ────────────────────────────────────
         if multi_tf_long:  long_conv  = min(10, long_conv  + cfg.MULTI_TF_BONUS)
         if multi_tf_short: short_conv = min(10, short_conv + cfg.MULTI_TF_BONUS)
 
@@ -387,6 +413,10 @@ class QFJPEngine:
             conviction = short_conv
             sl_p = last_sh if last_sh else c[i] + atr_v[i]*2.0
             tp_p = c[i] - (sl_p-c[i])*cfg.TP_RR
+
+        # Debug flags
+        vol_regime_blocked = (vol_reg == "LOW") or not volatr
+        decay_blocked      = not alv
 
         return Signal(
             direction=direction, tier=tier or "STD", conviction=conviction,
@@ -411,6 +441,8 @@ class QFJPEngine:
             htf_1h_bull=htf_1h_bull, htf_1h_bear=htf_1h_bear,
             multi_tf_aligned=(multi_tf_long if direction=="LONG" else
                               multi_tf_short if direction=="SHORT" else False),
+            vol_regime_blocked=vol_regime_blocked,
+            decay_blocked=decay_blocked,
         )
 
     def _df(self, raw):

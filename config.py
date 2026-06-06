@@ -1,4 +1,11 @@
-"""Config v5.5 — Pine Script v3.2 integrado"""
+"""
+Config v6.2
+Cambios vs v5.5:
+  [F3] DECAY_THR default 0.25 (era 0.40) — decay menos restrictivo
+  [F4] SC_THR_STD=42, SC_THR_FUEL=55, SC_THR_SUP=70 — más señales
+  [D ] MAKER_TIMEOUT=15s, MAKER_OFFSET_PCT=0.05 — fill más rápido
+  [C ] MAX_DAILY_DD_PCT ahora NO se pasa a risk_manager — usa env var propio
+"""
 import os
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
@@ -17,44 +24,44 @@ class Config:
             "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,"
             "DOGE-USDT,ADA-USDT,AVAX-USDT,LINK-USDT,DOT-USDT").split(",")
     ])
-    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "10000000"))
+    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "5000000"))   # [E] era 10M
     MAX_SYMBOLS    : int   = int(os.getenv("MAX_SYMBOLS", "40"))
     LEVERAGE          : int   = int(os.getenv("LEVERAGE", "5"))
     RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PCT", "0.5"))
-    MAX_DAILY_DD_PCT  : float = float(os.getenv("MAX_DD_PCT", "5.0"))
+    MAX_DAILY_DD_PCT  : float = float(os.getenv("MAX_DD_PCT", "80.0"))         # [C] era 5.0
     MAX_OPEN_POSITIONS: int   = int(os.getenv("MAX_POSITIONS", "5"))
     TP_RR             : float = float(os.getenv("TP_RR", "2.0"))
     ALLOWED_SESSIONS: list[str] = field(default_factory=lambda: [
         s.strip() for s in os.getenv("SESSIONS", "NY,LDN").split(",") if s.strip()
     ])
     LOOP_INTERVAL   : int = int(os.getenv("LOOP_INTERVAL", "30"))
-    SCANNER_INTERVAL: int = int(os.getenv("SCANNER_INTERVAL", "3600"))
+    SCANNER_INTERVAL: int = int(os.getenv("SCANNER_INTERVAL", "900"))          # [F] era 3600
 
     # ── Umbrales señal ────────────────────────────────────────
-    SCORE_THR_LONG : float = float(os.getenv("SCORE_THR_LONG",  "0.10"))  # conv-boost lo sube
+    SCORE_THR_LONG : float = float(os.getenv("SCORE_THR_LONG",  "0.10"))
     SCORE_THR_SHORT: float = float(os.getenv("SCORE_THR_SHORT", "0.10"))
-    DECAY_THR      : float = float(os.getenv("DECAY_THR", "0.40"))
+    DECAY_THR      : float = float(os.getenv("DECAY_THR", "0.25"))             # [F3] era 0.40
 
-    # [M1] Decay adaptativo
-    DECAY_ADAPT_PCT: int  = int(os.getenv("DECAY_ADAPT_PCT", "30"))  # percentil 30
+    # Decay adaptativo
+    DECAY_ADAPT_PCT: int  = int(os.getenv("DECAY_ADAPT_PCT", "20"))            # era 30
 
-    # Score compuesto (Pine v3.2)
-    SC_THR_STD : int = int(os.getenv("SC_THR_STD",  "50"))  # 0-100
-    SC_THR_FUEL: int = int(os.getenv("SC_THR_FUEL", "63"))
-    SC_THR_SUP : int = int(os.getenv("SC_THR_SUP",  "75"))
+    # Score compuesto — [F4] thresholds más bajos
+    SC_THR_STD : int = int(os.getenv("SC_THR_STD",  "42"))                     # era 50
+    SC_THR_FUEL: int = int(os.getenv("SC_THR_FUEL", "55"))                     # era 63
+    SC_THR_SUP : int = int(os.getenv("SC_THR_SUP",  "70"))                     # era 75
 
-    MIN_CONV_STD  : int = int(os.getenv("MIN_CONV_STD",  "4"))
-    MIN_CONV_FUEL : int = int(os.getenv("MIN_CONV_FUEL", "5"))
-    MIN_CONV_SUP  : int = int(os.getenv("MIN_CONV_SUP",  "6"))
+    MIN_CONV_STD  : int = int(os.getenv("MIN_CONV_STD",  "3"))                 # era 4
+    MIN_CONV_FUEL : int = int(os.getenv("MIN_CONV_FUEL", "4"))                 # era 5
+    MIN_CONV_SUP  : int = int(os.getenv("MIN_CONV_SUP",  "5"))                 # era 6
     MIN_PROFIT_FACTOR: float = float(os.getenv("MIN_PF", "1.3"))
     PF_WINDOW        : int   = int(os.getenv("PF_WINDOW", "20"))
 
-    # [M2] ADX
+    # ADX
     ADX_LEN      : int   = int(os.getenv("ADX_LEN", "14"))
-    ADX_TREND_THR: float = float(os.getenv("ADX_TREND_THR", "25"))
+    ADX_TREND_THR: float = float(os.getenv("ADX_TREND_THR", "20"))             # era 25
 
-    # [M6] Filtro ATR
-    VOL_ATR_THR: float = float(os.getenv("VOL_ATR_THR", "0.70"))
+    # Filtro ATR
+    VOL_ATR_THR: float = float(os.getenv("VOL_ATR_THR", "0.50"))              # era 0.70
 
     # OFI / FR / OI
     OFI_LEVELS    : int   = int(os.getenv("OFI_LEVELS", "5"))
@@ -63,22 +70,23 @@ class Config:
     FR_BULL_THR   : float = float(os.getenv("FR_BULL_THR",    "0.0001"))
     FR_BEAR_THR   : float = float(os.getenv("FR_BEAR_THR",   "-0.0001"))
     FR_EXTREME_THR: float = float(os.getenv("FR_EXTREME_THR", "0.01"))
+
     OI_DELTA_THR  : float = float(os.getenv("OI_DELTA_THR", "0.003"))
 
     # Trailing SL
     TRAIL_ACTIVATE_ATR: float = float(os.getenv("TRAIL_ACTIVATE_ATR", "1.0"))
     TRAIL_ATR_MULT    : float = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
 
-    # Maker orders
+    # Maker orders — [D] offset mayor y timeout menor
     USE_MAKER_ORDERS: bool  = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
-    MAKER_TIMEOUT   : int   = int(os.getenv("MAKER_TIMEOUT", "30"))
-    MAKER_OFFSET_PCT: float = float(os.getenv("MAKER_OFFSET_PCT", "0.02"))
+    MAKER_TIMEOUT   : int   = int(os.getenv("MAKER_TIMEOUT", "15"))            # era 30
+    MAKER_OFFSET_PCT: float = float(os.getenv("MAKER_OFFSET_PCT", "0.05"))     # era 0.02
 
     # Multi-TF
     USE_1H_FILTER  : bool = os.getenv("USE_1H_FILTER", "false").lower() == "true"
     MULTI_TF_BONUS : int  = int(os.getenv("MULTI_TF_BONUS", "1"))
 
-    # Motor
+    # Motor (sin cambios)
     MOM_LEN : int   = 20;  REV_LEN : int   = 8
     VOL_LEN : int   = 14;  ATR_LEN : int   = 10
     W_MOM   : float = 0.40; W_REV  : float = 0.30;  W_VOL  : float = 0.30
@@ -92,7 +100,7 @@ class Config:
     HL_COUNT: int = 2;    HH_COUNT: int = 2;        HL_WINDOW: int = 40
     FVG_MIN : float = 0.2; FVG_BARS: int = 40;      FVG_MITI: bool = True
     OB_IMP  : float = 1.2; OB_BARS : int = 50
-    CVD_LEN : int = 20;   CVD_DIV : int = 5;        CVD_ROLL: int = 100  # [M3]
+    CVD_LEN : int = 20;   CVD_DIV : int = 5;        CVD_ROLL: int = 100
     SQ_LEN  : int = 20;   SQ_BBM  : float = 2.0;   SQ_KCM : float = 1.5
 
 cfg = Config()
