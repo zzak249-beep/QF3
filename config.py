@@ -1,15 +1,28 @@
 """
-Config v6.2
-Cambios vs v5.5:
-  [F3] DECAY_THR default 0.25 (era 0.40) — decay menos restrictivo
-  [F4] SC_THR_STD=42, SC_THR_FUEL=55, SC_THR_SUP=70 — más señales
-  [D ] MAKER_TIMEOUT=15s, MAKER_OFFSET_PCT=0.05 — fill más rápido
-  [C ] MAX_DAILY_DD_PCT ahora NO se pasa a risk_manager — usa env var propio
+Config v6.2 — FIX Railway env vars con sufijos ('900s', '30s', etc.)
 """
-import os
+import os, re
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
 load_dotenv()
+
+def _int(key: str, default: int) -> int:
+    """Lee env var como int, tolerando sufijos como '900s', '15m', '1h'."""
+    val = os.getenv(key, str(default)).strip()
+    m = re.match(r'^(\d+)', val)
+    return int(m.group(1)) if m else default
+
+def _float(key: str, default: float) -> float:
+    val = os.getenv(key, str(default)).strip()
+    m = re.match(r'^([0-9]*\.?[0-9]+)', val)
+    return float(m.group(1)) if m else default
+
+def _bool(key: str, default: bool) -> bool:
+    val = os.getenv(key, str(default)).strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+def _list(key: str, default: str) -> list[str]:
+    return [s.strip() for s in os.getenv(key, default).split(",") if s.strip()]
 
 @dataclass
 class Config:
@@ -19,74 +32,63 @@ class Config:
     TG_CHAT_ID    : str = os.getenv("TG_CHAT_ID", "")
     MODE         : str = os.getenv("MODE", "SIGNAL")
     SYMBOLS_MODE : str = os.getenv("SYMBOLS_MODE", "AUTO")
-    SYMBOLS_MANUAL: list[str] = field(default_factory=lambda: [
-        s.strip() for s in os.getenv("SYMBOLS",
-            "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,"
-            "DOGE-USDT,ADA-USDT,AVAX-USDT,LINK-USDT,DOT-USDT").split(",")
-    ])
-    MIN_VOLUME_USDT: float = float(os.getenv("MIN_VOLUME_USDT", "5000000"))   # [E] era 10M
-    MAX_SYMBOLS    : int   = int(os.getenv("MAX_SYMBOLS", "40"))
-    LEVERAGE          : int   = int(os.getenv("LEVERAGE", "5"))
-    RISK_PER_TRADE_PCT: float = float(os.getenv("RISK_PCT", "0.5"))
-    MAX_DAILY_DD_PCT  : float = float(os.getenv("MAX_DD_PCT", "80.0"))         # [C] era 5.0
-    MAX_OPEN_POSITIONS: int   = int(os.getenv("MAX_POSITIONS", "5"))
-    TP_RR             : float = float(os.getenv("TP_RR", "2.0"))
-    ALLOWED_SESSIONS: list[str] = field(default_factory=lambda: [
-        s.strip() for s in os.getenv("SESSIONS", "NY,LDN").split(",") if s.strip()
-    ])
-    LOOP_INTERVAL   : int = int(os.getenv("LOOP_INTERVAL", "30"))
-    SCANNER_INTERVAL: int = int(os.getenv("SCANNER_INTERVAL", "900"))          # [F] era 3600
+    SYMBOLS_MANUAL: list[str] = field(default_factory=lambda: _list("SYMBOLS",
+        "BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT,"
+        "DOGE-USDT,ADA-USDT,AVAX-USDT,LINK-USDT,DOT-USDT"))
+
+    MIN_VOLUME_USDT: float = _float("MIN_VOLUME_USDT", 5_000_000.0)
+    MAX_SYMBOLS    : int   = _int("MAX_SYMBOLS", 40)
+    LEVERAGE          : int   = _int("LEVERAGE", 5)
+    RISK_PER_TRADE_PCT: float = _float("RISK_PCT", 0.5)
+    MAX_DAILY_DD_PCT  : float = _float("MAX_DD_PCT", 80.0)
+    MAX_OPEN_POSITIONS: int   = _int("MAX_POSITIONS", 5)
+    TP_RR             : float = _float("TP_RR", 2.0)
+
+    ALLOWED_SESSIONS: list[str] = field(default_factory=lambda: _list("SESSIONS", "NY,LDN"))
+
+    LOOP_INTERVAL   : int = _int("LOOP_INTERVAL", 30)
+    SCANNER_INTERVAL: int = _int("SCANNER_INTERVAL", 900)   # FIX: tolera '900s'
 
     # ── Umbrales señal ────────────────────────────────────────
-    SCORE_THR_LONG : float = float(os.getenv("SCORE_THR_LONG",  "0.10"))
-    SCORE_THR_SHORT: float = float(os.getenv("SCORE_THR_SHORT", "0.10"))
-    DECAY_THR      : float = float(os.getenv("DECAY_THR", "0.25"))             # [F3] era 0.40
+    SCORE_THR_LONG : float = _float("SCORE_THR_LONG",  0.10)
+    SCORE_THR_SHORT: float = _float("SCORE_THR_SHORT", 0.10)
+    DECAY_THR      : float = _float("DECAY_THR", 0.25)
+    DECAY_ADAPT_PCT: int   = _int("DECAY_ADAPT_PCT", 20)
 
-    # Decay adaptativo
-    DECAY_ADAPT_PCT: int  = int(os.getenv("DECAY_ADAPT_PCT", "20"))            # era 30
+    SC_THR_STD : int = _int("SC_THR_STD",  42)
+    SC_THR_FUEL: int = _int("SC_THR_FUEL", 55)
+    SC_THR_SUP : int = _int("SC_THR_SUP",  70)
 
-    # Score compuesto — [F4] thresholds más bajos
-    SC_THR_STD : int = int(os.getenv("SC_THR_STD",  "42"))                     # era 50
-    SC_THR_FUEL: int = int(os.getenv("SC_THR_FUEL", "55"))                     # era 63
-    SC_THR_SUP : int = int(os.getenv("SC_THR_SUP",  "70"))                     # era 75
+    MIN_CONV_STD  : int   = _int("MIN_CONV_STD",  3)
+    MIN_CONV_FUEL : int   = _int("MIN_CONV_FUEL", 4)
+    MIN_CONV_SUP  : int   = _int("MIN_CONV_SUP",  5)
+    MIN_PROFIT_FACTOR: float = _float("MIN_PF", 1.3)
+    PF_WINDOW        : int   = _int("PF_WINDOW", 20)
 
-    MIN_CONV_STD  : int = int(os.getenv("MIN_CONV_STD",  "3"))                 # era 4
-    MIN_CONV_FUEL : int = int(os.getenv("MIN_CONV_FUEL", "4"))                 # era 5
-    MIN_CONV_SUP  : int = int(os.getenv("MIN_CONV_SUP",  "5"))                 # era 6
-    MIN_PROFIT_FACTOR: float = float(os.getenv("MIN_PF", "1.3"))
-    PF_WINDOW        : int   = int(os.getenv("PF_WINDOW", "20"))
+    ADX_LEN      : int   = _int("ADX_LEN", 14)
+    ADX_TREND_THR: float = _float("ADX_TREND_THR", 20.0)
 
-    # ADX
-    ADX_LEN      : int   = int(os.getenv("ADX_LEN", "14"))
-    ADX_TREND_THR: float = float(os.getenv("ADX_TREND_THR", "20"))             # era 25
+    VOL_ATR_THR: float = _float("VOL_ATR_THR", 0.50)
 
-    # Filtro ATR
-    VOL_ATR_THR: float = float(os.getenv("VOL_ATR_THR", "0.50"))              # era 0.70
+    OFI_LEVELS    : int   = _int("OFI_LEVELS", 5)
+    OFI_THR_WEAK  : float = _float("OFI_THR_WEAK",   0.2)
+    OFI_THR_STRONG: float = _float("OFI_THR_STRONG", 0.4)
+    FR_BULL_THR   : float = _float("FR_BULL_THR",    0.0001)
+    FR_BEAR_THR   : float = _float("FR_BEAR_THR",   -0.0001)
+    FR_EXTREME_THR: float = _float("FR_EXTREME_THR", 0.01)
+    OI_DELTA_THR  : float = _float("OI_DELTA_THR",   0.003)
 
-    # OFI / FR / OI
-    OFI_LEVELS    : int   = int(os.getenv("OFI_LEVELS", "5"))
-    OFI_THR_WEAK  : float = float(os.getenv("OFI_THR_WEAK", "0.2"))
-    OFI_THR_STRONG: float = float(os.getenv("OFI_THR_STRONG", "0.4"))
-    FR_BULL_THR   : float = float(os.getenv("FR_BULL_THR",    "0.0001"))
-    FR_BEAR_THR   : float = float(os.getenv("FR_BEAR_THR",   "-0.0001"))
-    FR_EXTREME_THR: float = float(os.getenv("FR_EXTREME_THR", "0.01"))
+    TRAIL_ACTIVATE_ATR: float = _float("TRAIL_ACTIVATE_ATR", 1.0)
+    TRAIL_ATR_MULT    : float = _float("TRAIL_ATR_MULT",     1.5)
 
-    OI_DELTA_THR  : float = float(os.getenv("OI_DELTA_THR", "0.003"))
+    USE_MAKER_ORDERS: bool  = _bool("USE_MAKER_ORDERS", True)
+    MAKER_TIMEOUT   : int   = _int("MAKER_TIMEOUT", 15)
+    MAKER_OFFSET_PCT: float = _float("MAKER_OFFSET_PCT", 0.05)
 
-    # Trailing SL
-    TRAIL_ACTIVATE_ATR: float = float(os.getenv("TRAIL_ACTIVATE_ATR", "1.0"))
-    TRAIL_ATR_MULT    : float = float(os.getenv("TRAIL_ATR_MULT", "1.5"))
+    USE_1H_FILTER  : bool = _bool("USE_1H_FILTER", False)
+    MULTI_TF_BONUS : int  = _int("MULTI_TF_BONUS", 1)
 
-    # Maker orders — [D] offset mayor y timeout menor
-    USE_MAKER_ORDERS: bool  = os.getenv("USE_MAKER_ORDERS", "true").lower() == "true"
-    MAKER_TIMEOUT   : int   = int(os.getenv("MAKER_TIMEOUT", "15"))            # era 30
-    MAKER_OFFSET_PCT: float = float(os.getenv("MAKER_OFFSET_PCT", "0.05"))     # era 0.02
-
-    # Multi-TF
-    USE_1H_FILTER  : bool = os.getenv("USE_1H_FILTER", "false").lower() == "true"
-    MULTI_TF_BONUS : int  = int(os.getenv("MULTI_TF_BONUS", "1"))
-
-    # Motor (sin cambios)
+    # Motor (constantes — no necesitan env vars)
     MOM_LEN : int   = 20;  REV_LEN : int   = 8
     VOL_LEN : int   = 14;  ATR_LEN : int   = 10
     W_MOM   : float = 0.40; W_REV  : float = 0.30;  W_VOL  : float = 0.30
