@@ -176,7 +176,13 @@ def _load_src(symbol, src, start_ms, end_ms, cache_dir):
             fetch.append((have_to + TF_MS, end_ms))
     new = []
     for a, b in fetch:
-        new += FETCH[src](sym, a, b)
+        try:
+            new += FETCH[src](sym, a, b)
+        except ValueError:
+            # con caché, el trozo que falta suele ser solo los últimos minutos (aún sin fichero
+            # diario en vision): no es un error, se usa lo que ya hay
+            if cached is None:
+                raise
     df = pd.DataFrame(new, columns=["ts", "open", "high", "low", "close", "volume"])
     if cached is not None:
         df = pd.concat([cached, df], ignore_index=True)

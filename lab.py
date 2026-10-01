@@ -309,10 +309,15 @@ def main(argv=None, a_override=None, b_override=None, c_override=None):
                     print(f"  C {s}: {len(df):,} velas ({src})", flush=True)
                 except Exception as e:
                     print(f"  C {s}: sin datos ({str(e)[:70]})", flush=True)
-        txt, v, tr = wec.study_c(frames_c, btc)
-        parts.append(txt)
-        verds.append("C · WEC mecha: " + v)
-        tr.to_csv(os.path.join(a.out, "c_operaciones.csv"), index=False)
+        if btc is None or len(frames_c) < 10:
+            v = f"⚠️ INVÁLIDO: faltan datos (BTC {'ok' if btc is not None else 'NO'}, {len(frames_c)} monedas)"
+            parts.append("## C · WEC v2\n\n**" + v + "**")
+            verds.append("C · WEC mecha: " + v)
+        else:
+            txt, v, tr = wec.study_c(frames_c, btc)
+            parts.append(txt + f"\n\n*Monedas con datos: {len(frames_c)}.*")
+            verds.append("C · WEC mecha: " + v)
+            tr.to_csv(os.path.join(a.out, "c_operaciones.csv"), index=False)
 
     report = ("# Laboratorio\n\n## Veredicto\n\n" + "\n".join("• " + x for x in verds) + "\n\n" +
               "\n\n".join(parts) + f"\n\n---\nCostes: {COST_RT*100:.2f}% ida y vuelta · Tiempo: {time.time()-t0:.0f}s\n")
