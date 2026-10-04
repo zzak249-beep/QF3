@@ -15,6 +15,8 @@ import math
 from wyckoff_engine import (DIR_ACCUM, DIR_DIST, ENTRY_NAMES, PHASE_A, PHASE_C, PHASE_E, PHASE_NAMES, TYPE_NAMES,
                             WyckoffEngine, na)
 
+from sdzones import ZoneTracker, obst_label
+
 FAIL_KIND = "Trampa (estructura rota)"
 
 
@@ -154,7 +156,7 @@ def apply_breadth(cands, timelines):
 
 # ── IDEA NUEVA: meta-etiquetado (un segundo modelo decide qué señales del indicador tomar) ──
 META_FEATURES = ("val", "conf", "rr", "range_atr", "log_b", "risk_pct", "ctx", "btc", "ema", "flow", "flow_exc",
-                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail")
+                 "breadth", "long", "kind_lps", "kind_sos", "kind_fail", "zone", "obst_r")
 
 
 def _align_num(x):
@@ -171,6 +173,8 @@ def meta_features(c):
         "breadth": c.get("breadth"), "long": 1.0 if c.get("side") == "LONG" else 0.0,
         "kind_lps": 1.0 if "LPS" in k else 0.0, "kind_sos": 1.0 if "SOS" in k else 0.0,
         "kind_fail": 1.0 if k == FAIL_KIND else 0.0,
+        "zone": 1.0 if c.get("zone_align") == "a favor" else 0.0,
+        "obst_r": min(c["obst_r"], 5.0) if c.get("obst_r") is not None else 5.0,
     }
 
 
@@ -279,6 +283,11 @@ def filters(sig, cfg, trend, ctx_align="neutral", btc_align="neutral"):
         why.append(f"estructura {cfg.CONTEXT_TF} en contra")
     if btc_align == "en contra" and cfg.BTC_FILTER == "bloquea":
         why.append(f"estructura de BTC {cfg.CONTEXT_TF} en contra")
+    if getattr(cfg, "ZONE_FILTER", "off") == "bloquea" and sig.get("zone_align") == "sin zona":
+        why.append("sin zona de oferta/demanda bajo el riesgo")
+    om = getattr(cfg, "OBSTACLE_MIN_R", 0.0)
+    if om > 0 and sig.get("obst_r") is not None and sig["obst_r"] < om:
+        why.append(f"zona opuesta a {sig['obst_r']:.2f}R (< {om}R)")
     return why
 
 
@@ -356,10 +365,11 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
     etiquetas de filtro; el backtest aplica después filtros + "una posición a la vez" de forma exacta.
     htf_ema: [(cierre_ms, ema)]; ctx_rows / btc_rows: velas del TF de contexto del símbolo y de BTC."""
     exits = exits or [exit_variant(cfg)]
-    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=100000, range_effort=range_effort)
-    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=100000, range_effort=range_effort) if ctx_rows else None
-    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=100000) if (btc_rows and ctx_tf_s) else None
-    j = k = kb = 0
+    eng = WyckoffEngine(tf_s, tick, strict, keep_bars=1500, range_effort=range_effort)
+    ctx = WyckoffEngine(ctx_tf_s, tick, strict, keep_bars=1500, range_effort=range_effort) if ctx_rows else None
+    btc = WyckoffEngine(ctx_tf_s, 0.1, strict, keep_bars=1500) if (btc_rows and ctx_tf_s) else None
+    j = k = kb = kz = 0
+    zt = ZoneTracker(tf_s * 1000, (ctx_tf_s * 1000) if ctx_rows else None, tick)
     ema = float("nan")
     cands, opens = [], []
     tf_ms = tf_s * 1000
@@ -378,6 +388,10 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
         if v <= 0 and h == l:
             continue  # mercado cerrado (TradFi): igual que en el bot, no alimenta al motor
         d = eng.update(t, o, h, l, c, v)
+        while ctx_rows and kz < len(ctx_rows) and ctx_rows[kz][0] + ctx_ms <= t + tf_ms:
+            zt.feed_htf(*ctx_rows[kz][:6])
+            kz += 1
+        zt.feed_chart(t, o, h, l, c, v)
         if timeline is not None:
             timeline[0].append(t + tf_ms)
             timeline[1].append(wyckoff_state(d))
@@ -403,14 +417,12 @@ def scan_candidates(rows, tf_s, tick, strict, cfg, warmup, htf_ema=None, ctx_row
         base = mk(exits[0][0])
         if base is None:
             continue
+        base.update(zt.features(base["side"], base["entry"], base["sl"]))
         base["flow"], base["flow_exc"] = flow_features(
             base["side"], rows[max(0, idx - 40):idx + 1],
             None if is_fail else (d["excT"] if not na(d["excT"]) else d["testT"]))
         cdir, clabel = context_of(ctx.last if ctx is not None else None)
         bdir, blabel = context_of(btc.last if btc is not None else None)
-        look = max(int(30 * 86400 / tf_s), 50)  # movimiento previo: cambio de precio en los 30 días anteriores
-        prior = round((c / rows[idx - look][4] - 1) * 100, 1) if idx >= look and rows[idx - look][4] > 0 else None
-        base.update(prior_move=prior)
         base.update(symbol=symbol, trend=trend_dir(c, ema), ctx_dir=cdir, ctx_label=clabel,
                     ctx_align=alignment(base["side"], cdir), btc_label=blabel,
                     btc_align=alignment(base["side"], bdir) if btc is not None else "neutral",

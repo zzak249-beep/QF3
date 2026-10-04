@@ -44,6 +44,7 @@ def main():
     ap.add_argument("--strict", default="Agresivo", help="Agresivo da más señales para aprender")
     ap.add_argument("--incluir-trampas", action="store_true", help="aprende también sobre las operaciones trampa")
     ap.add_argument("--guardar", action="store_true")
+    ap.add_argument("--guardar-si-pasa", action="store_true", help="guarda solo si la prueba de azar da <5%%")
     args = ap.parse_args()
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     cfg = cfg_with(TREND_FILTER="aviso", CONTEXT_FILTER="aviso", BTC_FILTER="aviso", BREADTH_FILTER="aviso",
@@ -53,7 +54,7 @@ def main():
     tr = sorted(select_trades(allc, cfg), key=lambda x: x["open_t"])
     print(f"{len(tr)} operaciones · {len(syms)} símbolos · {args.tf} · {args.days} días · exigencia {args.strict}")
     if len(tr) < 80:
-        print("⚠ Menos de 80 operaciones: el modelo aprendería ruido. Añade símbolos o días, o usa un TF menor.")
+        print("⚠ Menos de 80 operaciones: el modelo aprendería ruido. Añade símbolos o días (más histórico).")
         if len(tr) < 30:
             return
     cutoff = tr[0]["open_t"] + (tr[-1]["open_t"] - tr[0]["open_t"]) * 0.7
@@ -82,6 +83,7 @@ def main():
     print(f"AUC {auc(probs, labels):.3f}  (0.50 = no distingue ganadoras de perdedoras; 0.55+ empieza a ser algo)")
     print(f"todas las señales   {base['n']:>4} ops  media {base['avg']:+.3f}R  total {base['tot']:+.2f}R  PF {base['pf']:.2f}")
     print(f"filtradas p≥{m.thr:.2f}   {filt['n']:>4} ops  media {filt['avg']:+.3f}R  total {filt['tot']:+.2f}R  PF {filt['pf']:.2f}")
+    pval = None
     if keep and len(keep) < len(allr):
         rnd = random.Random(7)
         better = sum(1 for _ in range(5000)
@@ -94,6 +96,11 @@ def main():
     print("\n— qué ha aprendido (coeficientes estandarizados; + = sube la probabilidad de ganar) —")
     for k, w in sorted(m.w.items(), key=lambda kv: -abs(kv[1])):
         print(f"  {k:<10} {w:+.3f}")
+    if args.guardar_si_pasa and not args.guardar:
+        if pval is not None and pval < 0.05 and filt["avg"] > 0:
+            args.guardar = True
+        else:
+            print("\nNo se guarda el modelo: no supera la prueba de azar (o no mejora la media).")
     if args.guardar:
         m.save(C.META_MODEL, {"symbols": syms, "tf": args.tf, "days": args.days, "strict": args.strict,
                               "n_train": len(train), "test_avg_all": base["avg"], "test_avg_kept": filt["avg"],

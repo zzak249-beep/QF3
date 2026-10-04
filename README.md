@@ -1,6 +1,30 @@
-# Wyckoff Bot v5 (BingX · Railway · Telegram)
+# Wyckoff Bot v5.1 (BingX · Railway · Telegram)
 
 Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El motor (`wyckoff_engine.py`) es una traducción 1:1 de `f_engine()` del Pine: mismas constantes, fases A→E, resets y lógica de entrada (una por campaña según exigencia).
+
+## Evidencia que fija la configuración por defecto (2 oct 2026)
+Investigación con datos reales de BingX: 30 símbolos · 1h · 365 días · coste 0.08 %/lado.
+
+| | Operaciones | Media | PF | t |
+|---|---|---|---|---|
+| Indicador tal cual | 53 | −0.06R | 0.91 | −0.27 |
+| A favor de la EMA50 1h | 23 | **+0.42R** | 1.83 | +1.10 |
+| En contra de la EMA50 1h | 30 | −0.43R | 0.44 | −1.90 |
+| Trampa (estructura rota) | 45 | +0.00R | 1.01 | +0.02 |
+| 15m (solo 96 días en BingX) | 21 | −0.47R | 0.49 | −1.33 |
+
+Decisiones de la v5: **1h**, **TREND_FILTER=bloquea**, trampa **off**, meta-modelo **off** (no superó la prueba de azar).
+El filtro EMA es la mejor pista, **no** una certeza: salió de mirar ~15 desgloses (alguno destaca por azar) y con 23 operaciones.
+Por eso el bot arranca en SIGNAL y cada 20 operaciones manda un **veredicto** (media, t): solo con t≥2 en datos
+nuevos tiene sentido pasar a LIVE, y con riesgo mínimo.
+
+## v5.1 — zonas de oferta/demanda (script MTF S/D v3) como contexto
+No se opera el script: se usan sus zonas para **medir** si la ubicación mejora las señales Wyckoff.
+- `zone_align`: ¿hay zona de demanda (largos) / oferta (cortos) solapando el tramo SL→entrada? (el Spring/Test se apoyó en una zona)
+- `zone_touch`: visitas previas a esa zona. El script opera solo la fresca; el estudio arXiv 2101.07410 encontró lo contrario (más rebotes previos → más probable el siguiente). Se mide.
+- `obst_r`: distancia en R a la zona opuesta más cercana (muro antes del TP1).
+- `ZONE_FILTER` (off/aviso/bloquea) y `OBSTACLE_MIN_R` (0 = off). Por defecto solo aviso: el sweep de entradas incluye la dimensión zona.
+- Zonas del TF de operación y del `CONTEXT_TF` (4h), sin repintado (disponibles desde la vela que abre tras la confirmación).
 
 ## Archivos
 
@@ -11,15 +35,14 @@ Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El m
 | `main.py` | Bucle multi-TF: velas cerradas → motor → señal → SIGNAL (virtual) o LIVE (órdenes) |
 | `bingx.py` | Cliente BingX swap v2 (firma sobre el string exacto enviado, Hedge/One-Way, SL adjunto) |
 | `notify.py` | Telegram (avisos + comandos) y diario `journal.csv` |
+| `sdzones.py` | Zonas de oferta/demanda (port del script MTF S/D v3) como contexto de ubicación de cada señal |
 | `universe.py` | Clasifica cada perpetuo: cripto, forex, materia prima, acción, índice |
 | `config.py` | Variables de entorno (quita comillas) |
 | `backtest.py` | Backtest con el mismo motor/filtros/gestión, coste incluido, partición 70/30 y desgloses |
 | `meta.py` | Meta-etiquetado: un 2º modelo aprende qué señales del indicador tomar (walk-forward, purga, prueba de azar) |
+| `research.py` | Servicio de investigación en Railway (`RUN_MODE=research`): backtest + sweep + meta con datos reales, resultados a Telegram |
 | `sweep.py` | Barrido de variantes: elige en el 70% inicial, enseña el 30% final, corrige por nº de pruebas |
 | `test_engine.py` | Prueba sin red con ciclos sintéticos |
-| `portfolio.py` | **v5** Cartera con los topes del bot + Monte Carlo + `RISK_PCT` recomendado |
-| `parity.py` | **v5** Compara las entradas del motor con las del indicador en TradingView (CSV exportado) |
-| `test_v5.py` | **v5** Pruebas sin red: libro, cambio de stop, caché, cartera, Monte Carlo, paridad |
 | `railway.env.txt` | Plantilla para el Raw Editor de Railway |
 
 ## Gestión de cada operación
@@ -44,7 +67,7 @@ Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El m
 | Idea | Variable | Por defecto | Cómo se mide |
 |---|---|---|---|
 | TP2 más lejos (altura × N) | `TP2_MULT` | 1.0 (indicador) | `sweep.py --modo salidas` |
-| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off | `sweep.py --modo salidas` |
+| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off (empeoró en el sweep) | `sweep.py --modo salidas` |
 | Salida por tiempo si no llega a TP1 | `TIME_STOP_BARS` | 0 = off | `sweep.py --modo salidas` |
 | Estructura de BTC a favor/en contra | `BTC_FILTER` | aviso | desglose "por BTC" del backtest |
 | Funding en la señal (lado amontonado) | — | registro | columna `funding` del diario |
@@ -75,6 +98,13 @@ Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en co
 3. Volumen montado en `/data`.
 4. Arranca en `MODE=SIGNAL`. Para operar: `MODE=LIVE` **y** `CONFIRM_LIVE=SI`.
 
+## Investigación en Railway (sin ordenador)
+1. En el mismo proyecto: **New → GitHub Repo → el mismo repo del bot** (servicio nuevo, p. ej. `wyckoff-research`).
+2. Variables → Raw Editor → pega `railway.research.env.txt` (con tu token y chat de Telegram). Sin claves de BingX: no opera.
+3. Settings → región **Europa** (en EE. UU. Binance devuelve 451 y no hay flujo agresor; funciona igual con datos de BingX).
+4. Deploy. En 10-30 min llega a Telegram el resumen + el informe completo (+ `meta_model.json` solo si supera la prueba de azar).
+5. Al terminar queda en reposo. Para repetir con otros parámetros: cambia variables y Redeploy. Cuando acabes, borra el servicio.
+
 ## Antes de LIVE
 ```
 pip install requests
@@ -85,29 +115,3 @@ python sweep.py --modo salidas  --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSD
 python meta.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,AVAXUSDT,DOTUSDT --tf 15m --days 365 --incluir-trampas
 ```
 Manda la columna de **prueba** del sweep y la **prueba de azar** de meta.py. `meta.py --guardar` solo si la prueba de azar da <5%.
-
-## Novedades v5
-| Mejora | Variable | Qué resuelve |
-|---|---|---|
-| **Cambio de stop sin hueco** | — | Tras TP1 y en el trailing, el stop nuevo se coloca ANTES de cancelar el viejo (antes había unos instantes sin stop). Si el nuevo no entra (precio ya al otro lado), el viejo se queda. |
-| **Guarda del libro de órdenes** | `MAX_SLIP_R`, `DEPTH_LEVELS` | Antes de abrir, recorre el libro y estima spread + impacto en R. Si cuesta más de `MAX_SLIP_R` (0.10R) o el libro no tiene fondo, no entra. Importante con cientos de símbolos poco líquidos. |
-| **Caché de motores** | `ENGINE_CACHE`, `ENGINE_CACHE_EVERY_MIN` | Guarda los motores en `/data` cada 30 min y al recibir SIGTERM. Un reinicio de Railway tarda segundos (con ~300 símbolos × 2 TF, el recálculo son minutos). La caché se invalida sola si cambia `wyckoff_engine.py` o la exigencia. Comprobado: tras restaurar, el motor da exactamente lo mismo que uno que nunca se paró. |
-| **Cartera + Monte Carlo** | `RISK_TARGET_DD` | `backtest.py` ahora pasa las operaciones por los topes reales (máx. posiciones, misma dirección, pérdida diaria, enfriamiento), compone el capital y calcula la caída máxima. Monte Carlo reordena las operaciones y dice cuánta caída esperar y qué `RISK_PCT` cabe en tu tolerancia. |
-| **Paridad con TradingView** | — | `parity.py` compara entradas del motor y del indicador sobre las mismas velas. Hasta que no coincidan, el backtest mide "el motor de Python", no "el indicador". |
-| **Backtest con velas de BingX** | `--source` | Por defecto usa BingX (donde opera el bot), no Binance. El volumen es lo que más alimenta al motor. |
-| **Desgloses nuevos** | — | Por sesión (Asia/Europa/EE.UU.), fin de semana y distancia del stop. |
-
-### Orden recomendado antes de LIVE
-```
-python test_engine.py && python test_v5.py
-python parity.py --csv BINGX_BTCUSDT.P_60.csv --tf 1h --expected expected.csv   # ¿mismo resultado que TradingView?
-python backtest.py --symbols BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT --tf 1h --days 365
-python sweep.py --modo entradas --symbols ... --tf 1h --days 365
-```
-
-### Backtest con el universo entero (más operaciones = conclusiones)
-```
-python backtest.py --symbols auto --top 150 --clase crypto --tf 1h --days 365
-python backtest.py --symbols auto --top 100 --clase stock  --tf 1h --days 365   # ¿funciona en acciones/TradFi?
-```
-Con 8 símbolos salen ~10 operaciones al año: no distingue nada. El desglose "clase de activo" separa cripto de TradFi.

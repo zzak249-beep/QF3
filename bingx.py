@@ -25,19 +25,6 @@ class BingXError(Exception):
     pass
 
 
-def walk_book(levels, qty):
-    """Precio medio al que se llena `qty` recorriendo niveles [(precio, cantidad)] de mejor a peor.
-    None si los niveles no alcanzan para llenarla (libro demasiado fino)."""
-    left, cost = qty, 0.0
-    for px, q in levels:
-        take = min(left, q)
-        cost += take * px
-        left -= take
-        if left <= 1e-12:
-            return cost / qty
-    return None
-
-
 class BingX:
     def __init__(self, key, secret, vst=False):
         self.key, self.secret = key, secret
@@ -124,24 +111,6 @@ class BingX:
     def price(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/price", {"symbol": symbol})
         return float(d["price"])
-
-    def depth(self, symbol, limit=20):
-        """Libro: (bids de mejor a peor, asks de mejor a peor), cada nivel (precio, cantidad)."""
-        d = self._req("GET", "/openApi/swap/v2/quote/depth", {"symbol": symbol, "limit": limit}) or {}
-
-        def lv(rows):
-            out = []
-            for r in rows or []:
-                try:
-                    if isinstance(r, dict):
-                        out.append((float(r["price"]), float(r.get("quantity", r.get("qty", 0)))))
-                    else:
-                        out.append((float(r[0]), float(r[1])))
-                except (KeyError, ValueError, IndexError, TypeError):
-                    continue
-            return out
-
-        return sorted(lv(d.get("bids")), key=lambda x: -x[0]), sorted(lv(d.get("asks")), key=lambda x: x[0])
 
     def funding_rate(self, symbol):
         d = self._req("GET", "/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
