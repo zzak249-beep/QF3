@@ -1,30 +1,6 @@
-# Wyckoff Bot v5.1 (BingX · Railway · Telegram)
+# Wyckoff Bot v4 (BingX · Railway · Telegram)
 
 Ejecuta en BingX las entradas del indicador **Wyckoff ES [theUltimator5]**. El motor (`wyckoff_engine.py`) es una traducción 1:1 de `f_engine()` del Pine: mismas constantes, fases A→E, resets y lógica de entrada (una por campaña según exigencia).
-
-## Evidencia que fija la configuración por defecto (2 oct 2026)
-Investigación con datos reales de BingX: 30 símbolos · 1h · 365 días · coste 0.08 %/lado.
-
-| | Operaciones | Media | PF | t |
-|---|---|---|---|---|
-| Indicador tal cual | 53 | −0.06R | 0.91 | −0.27 |
-| A favor de la EMA50 1h | 23 | **+0.42R** | 1.83 | +1.10 |
-| En contra de la EMA50 1h | 30 | −0.43R | 0.44 | −1.90 |
-| Trampa (estructura rota) | 45 | +0.00R | 1.01 | +0.02 |
-| 15m (solo 96 días en BingX) | 21 | −0.47R | 0.49 | −1.33 |
-
-Decisiones de la v5: **1h**, **TREND_FILTER=bloquea**, trampa **off**, meta-modelo **off** (no superó la prueba de azar).
-El filtro EMA es la mejor pista, **no** una certeza: salió de mirar ~15 desgloses (alguno destaca por azar) y con 23 operaciones.
-Por eso el bot arranca en SIGNAL y cada 20 operaciones manda un **veredicto** (media, t): solo con t≥2 en datos
-nuevos tiene sentido pasar a LIVE, y con riesgo mínimo.
-
-## v5.1 — zonas de oferta/demanda (script MTF S/D v3) como contexto
-No se opera el script: se usan sus zonas para **medir** si la ubicación mejora las señales Wyckoff.
-- `zone_align`: ¿hay zona de demanda (largos) / oferta (cortos) solapando el tramo SL→entrada? (el Spring/Test se apoyó en una zona)
-- `zone_touch`: visitas previas a esa zona. El script opera solo la fresca; el estudio arXiv 2101.07410 encontró lo contrario (más rebotes previos → más probable el siguiente). Se mide.
-- `obst_r`: distancia en R a la zona opuesta más cercana (muro antes del TP1).
-- `ZONE_FILTER` (off/aviso/bloquea) y `OBSTACLE_MIN_R` (0 = off). Por defecto solo aviso: el sweep de entradas incluye la dimensión zona.
-- Zonas del TF de operación y del `CONTEXT_TF` (4h), sin repintado (disponibles desde la vela que abre tras la confirmación).
 
 ## Archivos
 
@@ -35,12 +11,10 @@ No se opera el script: se usan sus zonas para **medir** si la ubicación mejora 
 | `main.py` | Bucle multi-TF: velas cerradas → motor → señal → SIGNAL (virtual) o LIVE (órdenes) |
 | `bingx.py` | Cliente BingX swap v2 (firma sobre el string exacto enviado, Hedge/One-Way, SL adjunto) |
 | `notify.py` | Telegram (avisos + comandos) y diario `journal.csv` |
-| `sdzones.py` | Zonas de oferta/demanda (port del script MTF S/D v3) como contexto de ubicación de cada señal |
 | `universe.py` | Clasifica cada perpetuo: cripto, forex, materia prima, acción, índice |
 | `config.py` | Variables de entorno (quita comillas) |
 | `backtest.py` | Backtest con el mismo motor/filtros/gestión, coste incluido, partición 70/30 y desgloses |
 | `meta.py` | Meta-etiquetado: un 2º modelo aprende qué señales del indicador tomar (walk-forward, purga, prueba de azar) |
-| `research.py` | Servicio de investigación en Railway (`RUN_MODE=research`): backtest + sweep + meta con datos reales, resultados a Telegram |
 | `sweep.py` | Barrido de variantes: elige en el 70% inicial, enseña el 30% final, corrige por nº de pruebas |
 | `test_engine.py` | Prueba sin red con ciclos sintéticos |
 | `railway.env.txt` | Plantilla para el Raw Editor de Railway |
@@ -67,7 +41,7 @@ No se opera el script: se usan sus zonas para **medir** si la ubicación mejora 
 | Idea | Variable | Por defecto | Cómo se mide |
 |---|---|---|---|
 | TP2 más lejos (altura × N) | `TP2_MULT` | 1.0 (indicador) | `sweep.py --modo salidas` |
-| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off (empeoró en el sweep) | `sweep.py --modo salidas` |
+| Trailing tras TP1 (cierre − N×ATR) | `TRAIL_ATR` | 0 = off | `sweep.py --modo salidas` |
 | Salida por tiempo si no llega a TP1 | `TIME_STOP_BARS` | 0 = off | `sweep.py --modo salidas` |
 | Estructura de BTC a favor/en contra | `BTC_FILTER` | aviso | desglose "por BTC" del backtest |
 | Funding en la señal (lado amontonado) | — | registro | columna `funding` del diario |
@@ -97,13 +71,6 @@ Un segundo motor Wyckoff corre en 4h. Cada señal sale marcada **a favor / en co
 2. Railway → Variables → Raw Editor → pega `railway.env.txt`.
 3. Volumen montado en `/data`.
 4. Arranca en `MODE=SIGNAL`. Para operar: `MODE=LIVE` **y** `CONFIRM_LIVE=SI`.
-
-## Investigación en Railway (sin ordenador)
-1. En el mismo proyecto: **New → GitHub Repo → el mismo repo del bot** (servicio nuevo, p. ej. `wyckoff-research`).
-2. Variables → Raw Editor → pega `railway.research.env.txt` (con tu token y chat de Telegram). Sin claves de BingX: no opera.
-3. Settings → región **Europa** (en EE. UU. Binance devuelve 451 y no hay flujo agresor; funciona igual con datos de BingX).
-4. Deploy. En 10-30 min llega a Telegram el resumen + el informe completo (+ `meta_model.json` solo si supera la prueba de azar).
-5. Al terminar queda en reposo. Para repetir con otros parámetros: cambia variables y Redeploy. Cuando acabes, borra el servicio.
 
 ## Antes de LIVE
 ```

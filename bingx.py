@@ -257,6 +257,23 @@ class BingX:
             out.append(o)
         return out
 
+    def realized_pnl(self, symbol, start_ms):
+        """PnL realizado + comisiones + funding de `symbol` desde start_ms (USDT), según el libro de ingresos
+        de BingX. None si no hay datos (el llamante cae a la estimación)."""
+        d = self._req("GET", "/openApi/swap/v2/user/income",
+                      {"symbol": symbol, "startTime": start_ms, "limit": 200}, signed=True)
+        rows = d if isinstance(d, list) else (d or {}).get("data", []) if isinstance(d, dict) else []
+        tot, n = 0.0, 0
+        for r in rows:
+            kind = str(r.get("incomeType", r.get("income_type", ""))).upper()
+            if kind in ("REALIZED_PNL", "TRADING_FEE", "FUNDING_FEE", "COMMISSION", "FEE"):
+                try:
+                    tot += float(r.get("income", 0))
+                    n += 1
+                except (TypeError, ValueError):
+                    pass
+        return tot if n else None
+
     def order_exists(self, symbol, client_id):
         """Tras un fallo de red al abrir: ¿la orden llegó al exchange?"""
         try:

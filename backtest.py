@@ -21,12 +21,9 @@ from statistics import NormalDist
 import requests
 
 import config as C
-from sdzones import obst_label
 from strategy import FAIL_KIND, META, MetaModel, apply_breadth, scan_candidates, select_trades
 
 TIMELINES = {}
-COVERAGE = {}
-_WARNED = set()
 
 BINANCE = "https://fapi.binance.com/fapi/v1/klines"
 BINGX = "https://open-api.bingx.com/openApi/swap/v3/quote/klines"
@@ -138,13 +135,6 @@ def load_symbol(sym, tf, days, warmup, strict, cfg, exits=None):
     if len(rows) < warmup + 50:
         print(f"{sym}: pocas velas ({len(rows)})")
         return []
-    got = (rows[-1][0] - rows[0][0]) / 86400000 - warmup * tf_s / 86400
-    COVERAGE[(sym, tf)] = (rows[0][0], rows[-1][0], got)
-    if got < days * 0.8 and (sym, tf) not in _WARNED:
-        _WARNED.add((sym, tf))
-        print(f"⚠ {sym}: solo hay {got:.0f} días útiles de {tf} (pedidos {days})"
-              + (" — BingX guarda poco histórico en TF bajos; con Binance (región Europa) o 1h hay más"
-                 if use_bingx(sym) else ""))
     ema = None
     if cfg.TREND_FILTER != "off":
         ms = C.tf_seconds(cfg.TREND_TF) * 1000
@@ -234,12 +224,6 @@ def report(trades, n_tests):
         groups["flujo agresor últimas 10 velas"][bucket_n(x.get("flow"), (-0.05, 0.05), ("en contra", "neutro", "a favor"))].append(x["r"])
         groups["flujo agresor en el Spring/UTAD"][bucket_n(x.get("flow_exc"), (-0.1, 0.1), ("venta/compra absorbida", "neutro", "a favor"))].append(x["r"])
         groups["amplitud Wyckoff (resto de símbolos)"][x.get("breadth_align", "-")].append(x["r"])
-        groups["zona S/D bajo el riesgo"][x.get("zone_align", "-")].append(x["r"])
-        zt_ = x.get("zone_touch")
-        groups["toques previos de esa zona"]["sin zona" if zt_ is None else ("0-1" if zt_ <= 1 else "2+")].append(x["r"])
-        groups["zona opuesta (obstáculo)"][obst_label(x.get("obst_r"))].append(x["r"])
-        groups["EMA × zona"][("EMA a favor" if not x.get("against_trend") else "EMA en contra") + " · "
-                             + x.get("zone_align", "-")].append(x["r"])
         groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
         groups["símbolo"][x["symbol"]].append(x["r"])
     for g, d in groups.items():
@@ -268,14 +252,11 @@ def main():
     ap.add_argument("--fail", default=C.FAIL_TRADES, help="off | aviso | on (incluir las trampas en el resultado)")
     ap.add_argument("--breadth-filter", default=C.BREADTH_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--meta-filter", default="off", help="off | bloquea (aplica meta_model.json)")
-    ap.add_argument("--zone-filter", default=C.ZONE_FILTER, help="off | aviso | bloquea")
-    ap.add_argument("--obstacle-min-r", type=float, default=C.OBSTACLE_MIN_R)
     ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
     args = ap.parse_args()
     C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
     C.TP2_MULT, C.TRAIL_ATR, C.TIME_STOP_BARS, C.BTC_FILTER = args.tp2_mult, args.trail_atr, args.time_stop, args.btc_filter
     C.FAIL_TRADES, C.BREADTH_FILTER, C.META_FILTER = args.fail, args.breadth_filter, args.meta_filter
-    C.ZONE_FILTER, C.OBSTACLE_MIN_R = args.zone_filter, args.obstacle_min_r
     global SOURCE
     SOURCE = args.source
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]

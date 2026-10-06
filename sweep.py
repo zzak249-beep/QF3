@@ -60,8 +60,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=400)
     args = ap.parse_args()
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]  # con guion → datos de BingX (TradFi)
-    scan_cfg = cfg_with(TREND_FILTER="aviso", CONTEXT_FILTER="aviso", BTC_FILTER="aviso", ZONE_FILTER="aviso",
-                        OBSTACLE_MIN_R=0.0)
+    scan_cfg = cfg_with(TREND_FILTER="aviso", CONTEXT_FILTER="aviso", BTC_FILTER="aviso")
 
     if args.modo == "entradas":
         cands = {}
@@ -71,16 +70,14 @@ def main():
             print(f"{strict}: {len(cands[strict])} entradas del motor")
         times = sorted(c["open_t"] for c in cands["Agresivo"]) or [0]
         cutoff = times[0] + (times[-1] - times[0]) * 0.7
-        # 48 variantes: exigencia × EMA × estructura 4h × zona S/D × R:R mínimo
         grid = list(itertools.product(("Agresivo", "Estándar", "Conservador"), ("off", "bloquea"), ("off", "bloquea"),
-                                      ("off", "bloquea"), (0.0, 1.5)))
+                                      (0.0, 1.0, 1.5, 2.0)))
         rows = []
-        for strict, trend, ctx, zone, rr in grid:
-            cfg = cfg_with(TREND_FILTER=trend, CONTEXT_FILTER=ctx, BTC_FILTER="aviso", MIN_RR=rr, ZONE_FILTER=zone,
-                           OBSTACLE_MIN_R=0.0)
+        for strict, trend, ctx, rr in grid:
+            cfg = cfg_with(TREND_FILTER=trend, CONTEXT_FILTER=ctx, BTC_FILTER="aviso", MIN_RR=rr)
             a, b, t = split(select_trades(cands[strict], cfg), cutoff)
-            rows.append((f"{strict:<12}{trend:<9}{ctx:<9}{zone:<9}{rr:>4.1f}", a, b, t))
-        table(rows, len(grid), f"{'exigencia':<12}{'EMA':<9}{'ctx':<9}{'zona':<9}{'RR':>4}")
+            rows.append((f"{strict:<12}{trend:<9}{ctx:<9}{rr:>4.1f}", a, b, t))
+        table(rows, len(grid), f"{'exigencia':<12}{'EMA':<9}{'ctx':<9}{'RR':>4}")
     else:
         grid = [exit_variant(C, TP2_MULT=m, TRAIL_ATR=tr, TIME_STOP_BARS=ts)
                 for m, tr, ts in itertools.product((1.0, 1.5, 2.0), (0.0, 1.5, 3.0), (0, 32, 96))]
