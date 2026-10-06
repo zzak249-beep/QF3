@@ -128,3 +128,17 @@ assert b.ex.cancelled == ["y"], b.ex.cancelled
 assert any("SIN estado" in m for m in msgs)
 print("8 OK reconcile protege posiciones vivas")
 print("TODO OK")
+
+# 9) tamaño fijo 10 USDT: posición ≈ 10 USDT, sin TP1 si no se puede partir, salida única en TP1
+C.NOTIONAL_USDT = 10.0
+b = mk(); msgs.clear(); b.ex.contracts["AAA-USDT"]["min_qty"] = 0.1; b.ex.contracts["AAA-USDT"]["qp"] = 1
+b.ex.fmt_qty = lambda s, q: int(q * 10) / 10  # qp=1 como un contrato caro
+b.ex.px = b.ex.fill = 100.0
+b.open_live("AAA-USDT", sig(), "txt")
+rec = b.state["positions"]["AAA-USDT"]
+assert abs(rec["qty"] * 100 - 10) < 1e-6 and rec.get("single"), rec
+tps = [o for o in b.ex.orders if o["type"] == "TAKE_PROFIT_MARKET"]
+assert len(tps) == 1 and "103.0" in tps[0]["orderId"], tps   # sale entera en TP1
+print("9 OK posición fija 10 USDT con salida única")
+C.NOTIONAL_USDT = 0.0
+print("TODO OK 2")

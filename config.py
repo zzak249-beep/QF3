@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 4.1.0-live (2026-10-06)"
+CODE_VERSION = "wyckoff-bot 4.2.0-live (2026-10-06)"
 
 
 def _raw(name, default):
@@ -112,6 +112,8 @@ MOVE_SL_TO_BE = _b("MOVE_SL_TO_BE", True)
 # ── Riesgo ──
 RISK_PCT = _f("RISK_PCT", 0.5)                   # % del equity arriesgado por operación
 LEVERAGE = _i("LEVERAGE", 5)
+NOTIONAL_USDT = _f("NOTIONAL_USDT", 0.0)         # >0 = tamaño FIJO de posición en USDT (ignora RISK_PCT). 0 = tamaño por riesgo
+SINGLE_TP = _s("SINGLE_TP", "tp1").lower()       # si la posición es tan pequeña que no se puede partir en TP1/TP2: sale entera en tp1 | tp2
 MARGIN_MODE = _s("MARGIN_MODE", "ISOLATED").upper()
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 2)         # posiciones de ESTE bot
 MAX_TOTAL_POSITIONS = _i("MAX_TOTAL_POSITIONS", 4)  # posiciones de TODA la cuenta (otros bots y manuales)
@@ -149,5 +151,5 @@ def tf_seconds(tf):
 def summary():
     return (f"modo {'LIVE' if LIVE else 'SIGNAL'}{' (VST)' if VST else ''} · TF {','.join(TIMEFRAMES)} · contexto {CONTEXT_TF or '-'} ({CONTEXT_FILTER})"
             f" · exigencia {ENTRY_STRICTNESS}"
-            f" · riesgo {RISK_PCT}% · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
+            f" · {(f'posición fija {NOTIONAL_USDT:g} USDT' if NOTIONAL_USDT > 0 else f'riesgo {RISK_PCT}%')} · x{LEVERAGE} {MARGIN_MODE} · máx {MAX_CONCURRENT} (cuenta {MAX_TOTAL_POSITIONS})"
             f" · R:R≥{MIN_RR} · tendencia {TREND_FILTER} {TREND_TF}")

@@ -513,7 +513,10 @@ class Bot:
         if adv > C.CHASE_MAX_R or (price - sig["sl"]) * d <= 0:
             self.tg.send(txt + f"\n⏸ No se persigue: el precio ya avanzó {adv:+.2f}R")
             return
-        qty = equity * C.RISK_PCT / 100.0 / abs(price - sig["sl"])
+        if C.NOTIONAL_USDT > 0:
+            qty = C.NOTIONAL_USDT / price  # tamaño fijo: el riesgo en USDT es ≈ NOTIONAL × distancia al stop
+        else:
+            qty = equity * C.RISK_PCT / 100.0 / abs(price - sig["sl"])
         qty = ex.fmt_qty(sym, min(qty, avail * C.LEVERAGE * 0.9 / price))
         c = ex.contracts[sym]
         if qty <= 0 or qty < c["min_qty"] or qty * price < max(c["min_usdt"], 2.0):
@@ -589,7 +592,9 @@ class Bot:
                     if not rec["tp2_id"]:
                         rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", q2, sig["tp2"])
                 elif not rec["tp2_id"]:
-                    rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", amt, sig["tp2"])
+                    rec["single"] = True  # posición demasiado pequeña para partirla: una sola salida
+                    rec["tp2_id"] = ex.exit_order(sym, long, "TAKE_PROFIT_MARKET", amt,
+                                                  sig["tp1"] if C.SINGLE_TP == "tp1" else sig["tp2"])
                 err = None
                 break
             except BingXError as e:
@@ -602,7 +607,9 @@ class Bot:
         self.state["positions"][sym] = rec
         self.save_state()
         slip = (entry - sig["entry"]) / sig["entry"] * 100 * d
-        self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} (desliz. {slip:+.3f}%)"
+        self.tg.send(txt + f"\n✅ <b>LIVE</b> abierta {amt} @ {self.fp(entry, sym)} · posición {amt * entry:.2f} USDT · "
+                     f"riesgo ≈ {amt * abs(entry - sig['sl']):.2f} USDT"
+                     + (" · sin TP1 parcial (tamaño mínimo)" if rec.get("single") else "") + f" (desliz. {slip:+.3f}%)"
                      + (" · SL en la orden" if self.attach_ok else ""))
 
     def guard(self):
@@ -823,7 +830,7 @@ class Bot:
         px_tp2 = self.order_fill(sym, rec.get("tp2_id"))
         px_sl = self.order_fill(sym, rec.get("sl_id"))
         if px_tp2:
-            exit_px, reason = px_tp2, "TP2"
+            exit_px, reason = px_tp2, ("TP (salida única)" if rec.get("single") else "TP2")
         elif px_sl:
             exit_px, reason = px_sl, ("trailing" if rec.get("trail_stop") else "BE" if rec.get("be") else "SL")
         else:
@@ -1034,7 +1041,7 @@ class Bot:
                 self.state["hwm"] = eq
                 self.save_state()
             self.tg.send(f"💰 Cuenta {'VST (demo)' if C.VST else 'REAL'}: equity {eq:.2f} USDT · disponible {av:.2f} · "
-                         f"riesgo/operación ≈ {eq * C.RISK_PCT / 100:.2f} USDT · pausa si cae {C.MAX_DD_PCT}% o {C.MAX_LOSS_STREAK} pérdidas seguidas")
+                         f"{('posición fija ' + format(C.NOTIONAL_USDT, 'g') + ' USDT') if C.NOTIONAL_USDT > 0 else ('riesgo/operación ≈ %.2f USDT' % (eq * C.RISK_PCT / 100))} · pausa si cae {C.MAX_DD_PCT}% o {C.MAX_LOSS_STREAK} pérdidas seguidas")
         t0 = time.time()
         self.refresh_universe(force=True)
         self.reconcile()
