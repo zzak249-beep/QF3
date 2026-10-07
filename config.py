@@ -1,7 +1,7 @@
 """Configuración desde variables de entorno. Todos los parsers quitan comillas (lección de Railway)."""
 import os
 
-CODE_VERSION = "wyckoff-bot 4.2.0-live (2026-10-06)"
+CODE_VERSION = "wyckoff-bot 4.3.0-live (2026-10-06)"
 
 
 def _raw(name, default):
@@ -118,6 +118,14 @@ MARGIN_MODE = _s("MARGIN_MODE", "ISOLATED").upper()
 MAX_CONCURRENT = _i("MAX_CONCURRENT", 2)         # posiciones de ESTE bot
 MAX_TOTAL_POSITIONS = _i("MAX_TOTAL_POSITIONS", 4)  # posiciones de TODA la cuenta (otros bots y manuales)
 MAX_DAILY_LOSS_R = _f("MAX_DAILY_LOSS_R", 3.0)
+# ── v4.3: complementos de precisión (off | aviso = solo registra | bloquea). Se activan SOLO si el sweep los valida ──
+ADX_FILTER = _s("ADX_FILTER", "aviso").lower()    # bloquea si ADX > ADX_MAX (reversión contra tendencia fuerte)
+ADX_MAX = _f("ADX_MAX", 30.0)
+ADX_LEN = _i("ADX_LEN", 14)
+DIV_FILTER = _s("DIV_FILTER", "aviso").lower()    # bloquea si el RSI no ha perdido fuerza desde el clímax
+DIV_MIN = _f("DIV_MIN", 5.0)
+RSI_LEN = _i("RSI_LEN", 14)
+AVWAP_FILTER = _s("AVWAP_FILTER", "aviso").lower()  # bloquea si el precio está en contra del VWAP anclado al clímax
 # ── v4.1: cortacircuitos para dinero real (todos pausan las aperturas; lo abierto se sigue gestionando) ──
 MAX_DD_PCT = _f("MAX_DD_PCT", 8.0)                # caída del equity desde su máximo (%) → pausa hasta /reanudar (0 = off)
 MAX_LOSS_STREAK = _i("MAX_LOSS_STREAK", 5)        # pérdidas seguidas → pausa hasta /reanudar (0 = off)

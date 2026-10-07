@@ -223,6 +223,9 @@ def report(trades, n_tests):
         groups["duración Fase B (velas)"][bucket(x.get("b_bars", 0), (60, 150), ("<60", "60-149", "150+"))].append(x["r"])
         groups["flujo agresor últimas 10 velas"][bucket_n(x.get("flow"), (-0.05, 0.05), ("en contra", "neutro", "a favor"))].append(x["r"])
         groups["flujo agresor en el Spring/UTAD"][bucket_n(x.get("flow_exc"), (-0.1, 0.1), ("venta/compra absorbida", "neutro", "a favor"))].append(x["r"])
+        groups["ADX en la entrada"][bucket_n(x.get("adx"), (20, 30), ("<20 (rango)", "20-30", "30+ (tendencia)"))].append(x["r"])
+        groups["RSI: impulso agotado desde el clímax"][bucket_n(x.get("rsi_gain"), (0, 10), ("<0 (no)", "0-10", "10+ (sí)"))].append(x["r"])
+        groups["AVWAP anclado al clímax"][x.get("avwap_align", "-")].append(x["r"])
         groups["amplitud Wyckoff (resto de símbolos)"][x.get("breadth_align", "-")].append(x["r"])
         groups["mes"][datetime.fromtimestamp(x["open_t"] / 1000, timezone.utc).strftime("%Y-%m")].append(x["r"])
         groups["símbolo"][x["symbol"]].append(x["r"])
@@ -252,11 +255,18 @@ def main():
     ap.add_argument("--fail", default=C.FAIL_TRADES, help="off | aviso | on (incluir las trampas en el resultado)")
     ap.add_argument("--breadth-filter", default=C.BREADTH_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--meta-filter", default="off", help="off | bloquea (aplica meta_model.json)")
+    ap.add_argument("--adx-filter", default=C.ADX_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--adx-max", type=float, default=C.ADX_MAX)
+    ap.add_argument("--div-filter", default=C.DIV_FILTER, help="off | aviso | bloquea")
+    ap.add_argument("--div-min", type=float, default=C.DIV_MIN)
+    ap.add_argument("--avwap-filter", default=C.AVWAP_FILTER, help="off | aviso | bloquea")
     ap.add_argument("--source", default="auto", help="auto | binance | bingx (TradFi: usa BingX, p. ej. NCFXEUR2USD-USDT)")
     args = ap.parse_args()
     C.TREND_FILTER, C.CONTEXT_TF, C.CONTEXT_FILTER, C.MIN_RR = args.trend, args.context_tf, args.context_filter, args.min_rr
     C.TP2_MULT, C.TRAIL_ATR, C.TIME_STOP_BARS, C.BTC_FILTER = args.tp2_mult, args.trail_atr, args.time_stop, args.btc_filter
     C.FAIL_TRADES, C.BREADTH_FILTER, C.META_FILTER = args.fail, args.breadth_filter, args.meta_filter
+    C.ADX_FILTER, C.ADX_MAX, C.DIV_FILTER, C.DIV_MIN, C.AVWAP_FILTER = (
+        args.adx_filter, args.adx_max, args.div_filter, args.div_min, args.avwap_filter)
     global SOURCE
     SOURCE = args.source
     syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]

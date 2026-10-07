@@ -26,7 +26,7 @@ from bingx import BingX, BingXError
 from notify import Journal, Telegram
 from universe import is_tradfi
 from strategy import (FAIL_KIND, MetaModel, TradeSim, alignment, breadth_label, build_fail_signal, build_signal,
-                      context_of, ema_last, filters, flow_features, trend_dir, wyckoff_state)
+                      context_of, ema_last, filters, flow_features, ind_features, trend_dir, wyckoff_state)
 from wyckoff_engine import (BIT_CTEST, BIT_SOS, BIT_SOW, BIT_SPRING, BIT_TEST, BIT_UTAD, DIR_ACCUM, PHASE_C,
                             PHASE_D, PHASE_NAMES, WyckoffEngine, has_bit)
 
@@ -36,6 +36,7 @@ logging.basicConfig(level=getattr(logging, C.LOG_LEVEL.upper(), logging.INFO),
 log = logging.getLogger("main")
 
 STATE_PATH = os.path.join(C.DATA_DIR, "state.json")
+ROWS_KEEP = 700
 ALL_TFS = list(dict.fromkeys(C.TIMEFRAMES + ([C.CONTEXT_TF] if C.CONTEXT_TF else [])))
 
 
@@ -72,6 +73,7 @@ class Bot:
         self.journal = Journal(C.DATA_DIR)
         self.pool = ThreadPoolExecutor(max_workers=max(1, C.FETCH_WORKERS))
         self.engines = {}          # (símbolo, tf) → motor
+        self.rows = {}             # (símbolo, tf) → últimas velas cerradas, para ADX / RSI / AVWAP
         self.symbols = []
         self.universe_ts = 0
         self.trend_cache = {}
@@ -204,6 +206,7 @@ class Bot:
         for key in list(self.engines):
             if key[0] not in syms:
                 del self.engines[key]
+                self.rows.pop(key, None)
         self.symbols = [s for s in syms if all((s, tf) in self.engines for tf in C.TIMEFRAMES)]
         self.universe_ts = time.time()
         log.info("universo: %d símbolos · %d motores", len(self.symbols), len(self.engines))
@@ -241,6 +244,8 @@ class Bot:
                     eng.update(t, o, h, l, c, v)
                 last = t
         eng.last_t = last
+        if tf in C.TIMEFRAMES:
+            self.rows[(sym, tf)] = [list(r[:6]) for r in rows if r[0] + tf_ms(tf) <= cut][-ROWS_KEEP:]
         self.engines[(sym, tf)] = eng
 
     # ── filtros de contexto ──
@@ -340,6 +345,10 @@ class Bot:
             d = None
             for t, o, h, l, c, v in fresh:
                 eng.last_t = t
+                if trading:
+                    buf = self.rows.setdefault((sym, tf), [])
+                    buf.append([t, o, h, l, c, v])
+                    del buf[:-ROWS_KEEP]
                 if dead_bar(o, h, l, c, v):
                     continue  # mercado cerrado (TradFi): no alimenta al motor
                 d = eng.update(t, o, h, l, c, v)
@@ -383,6 +392,8 @@ class Bot:
             return
         self.cooldown[sym] = time.time()
         sig["tf"] = tf
+        buf = self.rows.get((sym, tf), [])
+        sig.update(ind_features(buf, len(buf) - 1, sig["side"], d.get("climT"), C.ADX_LEN, C.RSI_LEN))
         sig["trend"] = self.trend(sym, sig["entry"])
         cdir, clabel = self.context(sym, tf)
         sig["ctx_label"] = clabel
@@ -433,6 +444,8 @@ class Bot:
                + (f"\n🌊 Flujo agresor {sig['flow']:+.2f}" + (f" · en el Spring/UTAD {sig['flow_exc']:+.2f}"
                                                               if sig["flow_exc"] is not None else "")
                   if sig["flow"] is not None else "")
+               + (f"\n📐 ADX {sig['adx']:.0f}" + (f" · RSI {sig['rsi_gain']:+.0f} desde el clímax" if sig["rsi_gain"] is not None else "")
+                  + f" · AVWAP {sig['avwap_align']}" if sig.get("adx") is not None else "")
                + (f"\n🧭 Amplitud Wyckoff {sig['breadth']:+.2f} ({sig['breadth_align']})" if sig["breadth"] is not None else "")
                + (f"\n🧠 Meta-modelo p={sig['meta_p']:.2f} (umbral {self.meta.thr:.2f})" if sig["meta_p"] is not None else "")
                + (f"\n🪤 Estructura rota: los del {'Spring' if sig['side'] == 'SHORT' else 'UTAD'} quedan atrapados"
@@ -476,6 +489,7 @@ class Bot:
                             "ctx_label": s.get("ctx_label"), "btc_align": s.get("btc_align"),
                             "funding": s.get("funding"), "range_atr": s.get("range_atr"), "b_bars": s.get("b_bars"),
                             "flow": s.get("flow"), "flow_exc": s.get("flow_exc"), "breadth": s.get("breadth"),
+                            "adx": s.get("adx"), "rsi_gain": s.get("rsi_gain"), "avwap_align": s.get("avwap_align"),
                             "meta_p": s.get("meta_p"),
                             "exit_reason": sim.reason, "mode": "SIGNAL"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} Virtual {s['side']} {sym} cerrada por {sim.reason}: {r:+.2f}R "
@@ -869,6 +883,7 @@ class Bot:
                             "btc_align": rec.get("btc_align"), "funding": rec.get("funding"),
                             "range_atr": rec.get("range_atr"), "b_bars": rec.get("b_bars"),
                             "flow": rec.get("flow"), "flow_exc": rec.get("flow_exc"), "breadth": rec.get("breadth"),
+                            "adx": rec.get("adx"), "rsi_gain": rec.get("rsi_gain"), "avwap_align": rec.get("avwap_align"),
                             "meta_p": rec.get("meta_p"), "mode": "LIVE"})
         self.tg.send(f"{'✅' if r > 0 else '❌'} {rec['side']} {sym} cerrada por {reason}: {r:+.2f}R "
                      f"en {mins:.0f} min (hoy {self.state['daily']['r']:+.2f}R)")
